@@ -1,0 +1,22 @@
+gadget ISW_2share
+    field bool
+    secrets a,b
+    secretouts c
+    inputs a0:2,b0:2
+    outputs c0:2
+    randoms ra,rb,r
+    @c=a&b
+    a0:=ra
+    a1:=a^a0
+    b0:=rb
+    b1:=b^b0
+    t0=a0&b1
+    t1=a1&b0
+    t2=r^t0
+    t3=t2^t1
+    t4=a0&b0
+    c0=t4^r
+    t5=a1&b1
+    c1=t5^t3
+    c=:c0^c1
+end
