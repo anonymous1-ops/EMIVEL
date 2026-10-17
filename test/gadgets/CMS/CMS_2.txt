@@ -1,0 +1,41 @@
+gadget CMS_2
+	inputs a0:3,b0:3
+	outputs c0:3
+	randoms r0:9
+	noise 0.3
+	u0=a0&b0
+	u1=a0&b1
+	u2=a0&b2
+	v0=u0^r0
+	v00=v0^r1
+	v1=u1^r1
+	v11=v1^r2
+	v2=u2^r2
+	v22=v2^r3
+	c00=v00^v11
+	c0=c00^v22
+
+	u3=a1&b0
+	u4=a1&b1
+	u5=a1&b2
+	v3=u3^r3
+	v33=v3^r4
+	v4=u4^r4
+	v44=v4^r5
+	v5=u5^r5
+	v55=v5^r6
+	c11=v33^v44
+	c1=c11^v55
+
+	u6=a2&b0
+	u7=a2&b1
+	u8=a2&b2
+	v6=u6^r6
+	v66=v6^r7
+	v7=u7^r7
+	v77=v7^r8
+	v8=u8^r8
+	v88=v8^r0
+	c22=v66^v77
+	c2=c22^v88
+end	

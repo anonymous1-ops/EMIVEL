@@ -1,0 +1,38 @@
+gadget IPM1
+    secrets a,b
+    inputs a1:3,b1:3
+    outputs c1:3
+    randoms ra2:3,rb2:3,r1:2
+    field 2**3-1
+    #noise 1
+    #para 1
+    l2 = 2
+
+    a2:=[ra2]
+    a1:=[a+(l2*a2)]
+
+    b2:=[rb2]
+    b1:=[b+(l2*b2)]
+
+    #r1=0
+
+    # matrix T
+    T11=a1*b1
+    t12=a1*b2
+    T12=t12*l2
+    T21=a2*b1
+    t22=a2*b2
+    T22=t22*l2
+
+    # matrix U
+    U21=(-r1)*(1/l2)
+
+    # matrix V
+    V12=T12+r1
+    V21=T21+U21
+
+    # outputs
+    c1=T11+V12
+    c2=V21+T22
+
+end

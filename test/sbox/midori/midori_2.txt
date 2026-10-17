@@ -1,0 +1,78 @@
+gadget Midori2
+	inputs a0:3,b0:3,c0:3,d0:3
+	outputs x0:3,y0:3,z0:3,t0:3
+
+	f0=d0&b0
+	aux1=d0&b1
+	f1=aux1^c1
+	aux2=d0&b2
+	aux3=aux2^d0
+	f2=aux3^b2
+	x0_0=f0
+	x0_1=x0_0^f1
+	x0_2=x0_1^f2
+	x0=x0_2^r0
+
+	aux4=d1&b0
+	f3=aux4^c0
+	aux5=d1&b1
+	f4=aux5^b1
+	aux6=d1&b2
+	f5=aux6^d1
+	x1_0=f3
+	x1_1=x1_0^f4
+	x1_2=x1_1^f5
+	x1=x1_2^r1
+
+	aux7=d2&b0
+	f6=aux7^d2
+	aux8=d2&b1
+	f7=aux8^b1
+	aux9=d2&b2
+	aux10=aux9^b2
+	f8=aux10^c2
+	x2_0=f6
+	x2_1=x2_0^f7
+	x2_2=x2_1^f8
+	x2_3=x2_2^r0
+	x2=x2_3^r1
+
+	aux11=d0&b0
+	g0=aux11^d0
+	aux12=d0&b1
+	aux13=aux12^d0
+	g1=aux13^c1
+	aux14=d0&b2
+	g2=aux14^b2
+	y0_0=g0
+	y0_1=y0_0^g1
+	y0_2=y0_1^g2
+	y0=y0_2^r2
+
+	aux15=d1&b0
+	aux16=aux15^d1
+	g3=aux16^c0
+	aux17=d1&b1
+	g4=aux17^b1
+	aux18=d1&b2
+	g5=aux18^d1
+	y1_0=g3
+	y1_1=y1_0^g4
+	y1_2=y1_1^g5
+	y1=y1_2^r3
+
+	aux19=d2&b0
+	g6=aux19^d2
+	aux20=d2&b1
+	g7=aux20^b1
+	aux21=d2&b2
+	aux22=aux21^d2
+	aux23=aux22^b2
+	g8=aux23^c2
+	y2_0=g6
+	y2_1=y2_0^g7
+	y2_2=y2_1^g8
+	y2_3=y2_2^r2
+	y2=y2_3^r3
+	
+end

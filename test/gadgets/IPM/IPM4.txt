@@ -1,0 +1,147 @@
+gadget IPM4
+    secrets a,b
+    inputs a1:6,b1:6
+    outputs c1:6
+    randoms ra2:6,rb2:6,r1:11
+    field 2**1
+    #noise 0.5
+    #para 1
+
+    l2 = 1
+    l3 = 1
+    l4 = 1
+    l5 = 1
+
+    a2:=[ra2]
+    a3:=[ra3]
+    a4:=[ra4]
+    a5:=[ra5]
+    a1:=[a+(l2*a2+l3*a3+l4*a4+l5*a5)]
+
+    b2:=[rb2]
+    b3:=[rb3]
+    b4:=[rb4]
+    b5:=[rb5]
+    b1:=[b+(l2*b2+l3*b3+l4*b4+l5*b5)]
+
+    #r1=0
+    #r2=0
+    #r3=0
+    #r4=0
+    #r5=0
+    #r6=0
+    #r7=0
+    #r8=0
+    #r9=0
+    #r10=0
+
+    # matrix T
+    T11=a1*b1
+    t12=a1*b2
+    T12=t12*l2
+    t13=a1*b3
+    T13=t13*l3
+    t14=a1*b4
+    T14=t14*l4
+    t15=a1*b5
+    T15=t15*l5
+    T21=a2*b1
+    t22=a2*b2
+    T22=t22*l2
+    t23=a2*b3
+    T23=t23*l3
+    t24=a2*b4
+    T24=t24*l4
+    t25=a2*b5
+    T25=t25*l5
+    T31=a3*b1
+    t32=a3*b2
+    T32=t32*l2
+    t33=a3*b3
+    T33=t33*l3
+    t34=a3*b4
+    T34=t34*l4
+    t35=a3*b5
+    T35=t35*l5
+    T41=a4*b1
+    t42=a4*b2
+    T42=t42*l2
+    t43=a4*b3
+    T43=t43*l3
+    t44=a4*b4
+    T44=t44*l4
+    t45=a4*b5
+    T45=t45*l5
+    T51=a5*b1
+    t52=a5*b2
+    T52=t52*l2
+    t53=a5*b3
+    T53=t53*l3
+    t54=a5*b4
+    T54=t54*l4
+    t55=a5*b5
+    T55=t55*l5
+
+    # matrix U
+    U21=(-r1)*(1/l2)
+    U23=r5*(1/l2)
+    U24=r6*(1/l2)
+    U25=r7*(1/l2)
+    U31=(-r2)*(1/l3)
+    U32=(-r5)*(1/l3)
+    U34=r8*(1/l3)
+    U35=r9*(1/l3)
+    U41=(-r3)*(1/l4)
+    U42=(-r6)*(1/l4)
+    U43=(-r8)*(1/l4)
+    U45=r10*(1/l4)
+    U51=(-r4)*(1/l5)
+    U52=(-r7)*(1/l5)
+    U53=(-r9)*(1/l5)
+    U54=(-r10)*(1/l5)
+
+    # matrix V
+    V12=T12+r1
+    V13=T13+r2
+    V14=T14+r3
+    V15=T15+r4
+    V21=T21+U21
+    V23=T23+U23
+    V24=T24+U24
+    V25=T25+U25
+    V31=T31+U31
+    V32=T32+U32
+    V34=T34+U34
+    V35=T35+U35
+    V41=T41+U41
+    V42=T42+U42
+    V43=T43+U43
+    V45=T45+U45
+    V51=T51+U51
+    V52=T52+U52
+    V53=T53+U53
+    V54=T54+U54
+
+    # outputs
+    sum_c11=T11+V12
+    sum_c12=sum_c11+V13
+    sum_c13=sum_c12+V14
+    c1=sum_c13+V15
+    sum_c21=V21+T22
+    sum_c22=sum_c21+V23
+    sum_c23=sum_c22+V24
+    c2=sum_c23+V25
+    sum_c31=V31+V32
+    sum_c32=sum_c31+T33
+    sum_c33=sum_c32+V34
+    c3=sum_c33+V35
+    sum_c41=V41+V42
+    sum_c42=sum_c41+V43
+    sum_c43=sum_c42+T44
+    c4=sum_c43+V45
+    sum_c51=V51+V52
+    sum_c52=sum_c51+V53
+    sum_c53=sum_c52+V54
+    c5=sum_c53+T55
+
+end

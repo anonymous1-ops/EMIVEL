@@ -1,0 +1,92 @@
+gadget SNIISW1
+    secrets a,b
+    inputs a1:3,b1:3
+    outputs c1:3
+    randoms rr1:3,re1:2,r1:2
+    field 2**7-1
+
+    #noise 1
+    #para 3
+
+    a1:=[rr1]
+    a2:=[a+a1]
+    b1:=[rr2]
+    b2:=[b+b1]
+
+    #r1=0
+
+    # refresh
+    b1=b1+re1
+    b2=b2+re1
+
+    reg=b1
+    reg=b2
+    
+    and0=a1 * b2
+    and1=a2 * b1
+
+    xor0=r1 + and0
+    xor1=r1 + and1
+
+    reg=and0
+    reg=and1
+    reg=xor0
+    reg=xor1
+
+    out11=a1*b1
+    out21=a2*b2
+
+    pc1=out11+xor0
+    pc2=out21+xor1
+    reg=pc1
+    reg=pc2
+    c1=pc1
+    c2=pc2
+
+end
+
+    secrets a,b
+    inputs a1:3,b1:3
+    outputs c1:3
+    randoms rr1:3,re1:2,r1:2
+    noise t
+    field 2**1
+    #para 3
+
+    a1:=[rr1]
+    a2:=[a+a1]
+    b1:=[rr2]
+    b2:=[b+b1]
+
+    # refresh
+    b1=b1+re1:0.1
+    b2=b2+re1:0.2
+
+    reg=b1
+    reg=b2
+
+    and0=a1 * b2:0.3;a1:0.1,a2:0.1
+    and1=a2 * b1:0.4
+
+    xor0=r1 + and0:0.5
+    xor1=r1 + and1:0.6
+
+    reg=and0
+    reg=and1
+    reg=xor0
+    reg=xor1
+
+    out11=a1*b1:0.7
+    out21=a2*b2:0.7
+
+    c1=[out11+xor0:0.9]
+    c2=[out21+xor1:0.9]
+    
+reg0=a1 * b2
+reg0=r1 + reg0
+reg0=a1*b1
+c1=a1*b1+r1 + a1 * b2
+reg0=a2 * b1
+reg0=r1 + a2 * b1
+reg0=a2*b2
+c2=a2*b2+r1 + a2 * b1

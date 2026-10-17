@@ -1,0 +1,181 @@
+gadget SNIISWREF4
+    secrets a,b
+    inputs a1:6,b1:6
+    outputs c1:6
+    randoms ra1:5,rb1:5,re1:6,r1:11
+    #field 2**1
+    #noise 0.5
+    #para 1
+    a1:=[ra1]
+    a2:=[ra2]
+    a3:=[ra3]
+    a4:=[ra4]
+    a5:=[a^a1^a2^a3^a4]
+
+    b1:=[rb1]
+    b2:=[rb2]
+    b3:=[rb3]
+    b4:=[rb4]
+    b5:=[b^b1^b2^b3^b4]
+
+    #r1=0
+    #r2=0
+    #r3=0
+    #r4=0
+    #r5=0
+    #r6=0
+    #r7=0
+    #r8=0
+    #r9=0
+    #r10=0
+
+    # refresh
+    # optimized glitch-robust SNI refresh
+    t1 = re1 ^ re2
+    reg = t1
+    t2 = re2 ^ re3
+    reg = t2
+    t3 = re3 ^ re4
+    reg = t3
+    t4 = re4 ^ re5
+    reg = t4
+    t5 = re5 ^ re1
+    reg = t5
+    b1 = b1 ^ t1
+    reg = b1
+    b2 = b2 ^ t2
+    reg = b2
+    b3 = b3 ^ t3
+    reg = b3
+    b4 = b4 ^ t4
+    reg = b4
+    b5 = b5 ^ t5
+    reg = b5
+
+    # AND
+    and11=a1 & b1
+    and12=a1 & b2
+    and13=a1 & b3
+    and14=a1 & b4
+    and15=a1 & b5
+    and21=a2 & b1
+    and22=a2 & b2
+    and23=a2 & b3
+    and24=a2 & b4
+    and25=a2 & b5
+    and31=a3 & b1
+    and32=a3 & b2
+    and33=a3 & b3
+    and34=a3 & b4
+    and35=a3 & b5
+    and41=a4 & b1
+    and42=a4 & b2
+    and43=a4 & b3
+    and44=a4 & b4
+    and45=a4 & b5
+    and51=a5 & b1
+    and52=a5 & b2
+    and53=a5 & b3
+    and54=a5 & b4
+    and55=a5 & b5
+
+    # masking
+    u12=r1 ^ and12
+    u21=r1 ^ and21
+    u13=r2 ^ and13
+    u31=r2 ^ and31
+    u14=r3 ^ and14
+    u41=r3 ^ and41
+    u15=r4 ^ and15
+    u51=r4 ^ and51
+    u23=r5 ^ and23
+    u32=r5 ^ and32
+    u24=r6 ^ and24
+    u42=r6 ^ and42
+    u25=r7 ^ and25
+    u52=r7 ^ and52
+    u34=r8 ^ and34
+    u43=r8 ^ and43
+    u35=r9 ^ and35
+    u53=r9 ^ and53
+    u45=r10 ^ and45
+    u54=r10 ^ and54
+
+    reg = and11
+    reg = and12
+    reg = and13
+    reg = and14
+    reg = and15
+    reg = and21
+    reg = and22
+    reg = and23
+    reg = and24
+    reg = and25
+    reg = and31
+    reg = and32
+    reg = and33
+    reg = and34
+    reg = and35
+    reg = and41
+    reg = and42
+    reg = and43
+    reg = and44
+    reg = and45
+    reg = and51
+    reg = and52
+    reg = and53
+    reg = and54
+    reg = and55
+    reg = u12
+    reg = u21
+    reg = u13
+    reg = u31
+    reg = u14
+    reg = u41
+    reg = u15
+    reg = u51
+    reg = u23
+    reg = u32
+    reg = u24
+    reg = u42
+    reg = u25
+    reg = u52
+    reg = u34
+    reg = u43
+    reg = u35
+    reg = u53
+    reg = u45
+    reg = u54
+
+    # outputs
+    temp11 = and11 ^ u12
+    temp12 = temp11 ^ u13
+    temp13 = temp12 ^ u14
+    final1 = temp13 ^ u15
+    temp21 = and22 ^ u21
+    temp22 = temp21 ^ u23
+    temp23 = temp22 ^ u24
+    final2 = temp23 ^ u25
+    temp31 = and33 ^ u31
+    temp32 = temp31 ^ u32
+    temp33 = temp32 ^ u34
+    final3 = temp33 ^ u35
+    temp41 = and44 ^ u41
+    temp42 = temp41 ^ u42
+    temp43 = temp42 ^ u43
+    final4 = temp43 ^ u45
+    temp51 = and55 ^ u51
+    temp52 = temp51 ^ u52
+    temp53 = temp52 ^ u53
+    final5 = temp53 ^ u54
+    reg = final1
+    reg = final2
+    reg = final3
+    reg = final4
+    reg = final5
+    c1=final1
+    c2=final2
+    c3=final3
+    c4=final4
+    c5=final5
+end

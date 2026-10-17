@@ -1,0 +1,36 @@
+gadget SNIISW2_p
+secrets a,b
+inputs a1:4,b1:4
+outputs c1:4
+randoms rr1:5,r1:4
+field 2**3-1
+
+a1:=[rr1]
+a2:=[rr2]
+a3:=[a+a2+a1]
+b1:=[rr3]
+b2:=[rr4]
+b3:=[b+b2+b1]
+
+reg0=a1 * b2
+t12=r1 + reg0
+reg1=a2 * b1
+t21=r1 + reg1
+reg2=a1 * b3
+t13=r2 + reg2
+reg3=a3 * b1
+t31=r2 + reg3
+reg4=a2 * b3
+t23=r3 + reg4
+reg5=a3 * b2
+t32=r3 + reg5
+out11=a1*b1
+out12=out11+t12
+c1=out12+t13
+out21=a2*b2
+out22=out21+t21
+c2=out22+t23
+out31=a3*b3
+out32=out31+t31
+c3=out32+t32
+end

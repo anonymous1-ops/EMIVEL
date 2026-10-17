@@ -1,0 +1,109 @@
+gadget snipara3
+	secrets a,b
+	inputs a0:4,b0:4
+	outputs c0:4
+	randoms rr1:7,r0:5
+	field 2**4
+	#noise 1
+
+	a0:=[rr1]
+	a1:=[rr2]
+    a2:=[rr3]
+	a3:=[a+a2+a1+a0]
+	b0:=[rr4]
+	b1:=[rr5]
+    b2:=[rr6]
+	b3:=[b+b2+b1+b0]
+
+
+	#r0=0
+	#r1=0
+	#r2=0
+	#r3=0
+	#r4=0
+
+	u0=a0*b0
+    u1=a1*b1
+	u2=a2*b2
+	u3=a3*b3
+
+    v0=u0+r0
+	v1=u1+r1
+	v2=u2+r2
+	v3=u3+r3
+
+    #reg=v0
+	#reg=v1
+	#reg=v2
+	#reg=v3
+
+	u03=a0*b3
+	u10=a1*b0
+	u21=a2*b1
+	u32=a3*b2
+	
+	v03=v0+u03
+	v10=v1+u10
+	v21=v2+u21
+	v32=v3+u32
+
+	#reg=v03
+	#reg=v10
+	#reg=v21
+	#reg=v32
+
+	u30=a3*b0
+	u01=a0*b1
+	u12=a1*b2
+	u23=a2*b3
+	
+	v30=v03+u30
+	v01=v10+u01
+	v12=v21+u12
+	v23=v32+u23
+
+	#reg=v30
+	#reg=v01
+	#reg=v12
+	#reg=v23
+
+    v11=v30+r3
+    v22=v01+r0
+	v33=v12+r1
+	v44=v23+r2
+
+	#reg=v11
+	#reg=v22
+	#reg=v33
+	#reg=v44
+
+	u02=a0*b2
+	u13=a1*b3
+	u20=a2*b0
+	u31=a3*b1
+
+	v111=v11+u02
+	v222=v22+u13
+	v333=v33+u20
+	v444=v44+u31
+
+	#reg=v111
+	#reg=v222
+	#reg=v333
+	#reg=v444
+
+	v1111=v111+r4
+	v2222=v222+r4
+	v3333=v333+r4
+	v4444=v444+r4
+
+	#reg=v1111
+	#reg=v2222
+	#reg=v3333
+	#reg=v4444
+
+	c0=v1111
+	c1=v2222
+	c2=v3333
+	c3=v4444
+end	

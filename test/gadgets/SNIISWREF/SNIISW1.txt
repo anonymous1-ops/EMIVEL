@@ -1,0 +1,48 @@
+gadget SNIISWREF1
+    secrets a,b
+    inputs a1:3,b1:3
+    outputs c1:3
+    randoms ra1:2,rb1:2,re1:2,r1:2
+    field 2**4
+    #noise 1
+    #para 4
+    a1:=[ra1]
+    a2:=[a+a1]
+
+    b1:=[rb1]
+    b2:=[b+b1]
+
+    #r1=0
+
+    # refresh
+    # optimized glitch-robust SNI refresh
+    b1 = b1 + re1
+    reg = b1
+    b2 = b2 + re1
+    reg = b2
+
+    # AND
+    and11=a1 * b1
+    and12=a1 * b2
+    and21=a2 * b1
+    and22=a2 * b2
+
+    # masking
+    u12=r1 + and12
+    u21=r1 + and21
+
+    reg = and11
+    reg = and12
+    reg = and21
+    reg = and22
+    reg = u12
+    reg = u21
+
+    # outputs
+    final1 = and11 + u12
+    final2 = and22 + u21
+    reg = final1
+    reg = final2
+    c1=final1
+    c2=final2
+end

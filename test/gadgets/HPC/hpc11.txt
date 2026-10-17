@@ -1,0 +1,42 @@
+gadget HPC11
+    secrets a,b
+    inputs a1:3,b1:3
+    outputs c1:3
+    randoms ra1:2,rb1:2,re1:2,r1:2
+    field 2**4
+    #noise 1
+    #para 1
+    a1:=[ra1]
+    a2:=[a+a1]
+
+    b1:=[rb1]
+    b2:=[b+b1]
+
+    #r1=0
+
+    # refresh
+    # optimized glitch-robust SNI refresh
+    b1 = b1 + re1
+    #reg = b1
+    b2 = b2 + re1
+    #reg = b2
+
+    # AND
+    u11=a1*b1
+    u12=a1*b2
+    u21=a2*b1
+    u22=a2*b2
+    #reg=u12
+    #reg=u21
+
+    # masking
+    v12=u12+r1
+    v21=u21+r1
+    #reg=v12
+    #reg=v21
+
+    # outputs
+    c1=v12+u11
+    c2=v21+u22
+
+end

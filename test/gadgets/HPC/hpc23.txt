@@ -1,0 +1,138 @@
+gadget hpc23
+    secrets a,b
+    inputs a1:5,b1:5
+    outputs c1:5
+    randoms ra1:4,rb1:4,r1:7
+    field 2**4
+    #noise 0.5
+    #para 1
+    a1:=[ra1]
+    a2:=[ra2]
+    a3:=[ra3]
+    a4:=[a+a1+a2+a3]
+
+    b1:=[rb1]
+    b2:=[rb2]
+    b3:=[rb3]
+    b4:=[b+b1+b2+b3]
+
+    #r1=0
+    #r2=0
+    #r3=0
+    #r4=0
+    #r5=0
+    #r6=0
+
+    # masking
+    a1_not = a1+1
+    a2_not = a2+1
+    a3_not = a3+1
+    a4_not = a4+1
+    u12 = a1_not*r1
+    u21 = a2_not*r1
+    v12 = b2+r1
+    v21 = b1+r1
+    u13 = a1_not*r2
+    u31 = a3_not*r2
+    v13 = b3+r2
+    v31 = b1+r2
+    u14 = a1_not*r3
+    u41 = a4_not*r3
+    v14 = b4+r3
+    v41 = b1+r3
+    u23 = a2_not*r4
+    u32 = a3_not*r4
+    v23 = b3+r4
+    v32 = b2+r4
+    u24 = a2_not*r5
+    u42 = a4_not*r5
+    v24 = b4+r5
+    v42 = b2+r5
+    u34 = a3_not*r6
+    u43 = a4_not*r6
+    v34 = b4+r6
+    v43 = b3+r6
+    a1b1 = a1*b1
+    a2b2 = a2*b2
+    a3b3 = a3*b3
+    a4b4 = a4*b4
+    reg=u11
+    reg=u12
+    reg=v12
+    reg=u13
+    reg=v13
+    reg=u14
+    reg=v14
+    reg=u21
+    reg=v21
+    reg=u22
+    reg=u23
+    reg=v23
+    reg=u24
+    reg=v24
+    reg=u31
+    reg=v31
+    reg=u32
+    reg=v32
+    reg=u33
+    reg=u34
+    reg=v34
+    reg=u41
+    reg=v41
+    reg=u42
+    reg=v42
+    reg=u43
+    reg=v43
+    reg=u44
+
+    # outputs
+    a1v12 = a1*v12
+    reg=a1v12
+    a1v13 = a1*v13
+    reg=a1v13
+    a1v14 = a1*v14
+    reg=a1v14
+    u12_plus = u12+a1v12
+    u13_plus = u13+a1v13
+    u14_plus = u14+a1v14
+    o11 = a1b1+u12_plus
+    o12 = o11+u13_plus
+    c1 = o12+u14_plus
+    a2v21 = a2*v21
+    reg=a2v21
+    a2v23 = a2*v23
+    reg=a2v23
+    a2v24 = a2*v24
+    reg=a2v24
+    u21_plus = u21+a2v21
+    u23_plus = u23+a2v23
+    u24_plus = u24+a2v24
+    o21 = a2b2+u21_plus
+    o22 = o21+u23_plus
+    c2 = o22+u24_plus
+    a3v31 = a3*v31
+    reg=a3v31
+    a3v32 = a3*v32
+    reg=a3v32
+    a3v34 = a3*v34
+    reg=a3v34
+    u31_plus = u31+a3v31
+    u32_plus = u32+a3v32
+    u34_plus = u34+a3v34
+    o31 = a3b3+u31_plus
+    o32 = o31+u32_plus
+    c3 = o32+u34_plus
+    a4v41 = a4*v41
+    reg=a4v41
+    a4v42 = a4*v42
+    reg=a4v42
+    a4v43 = a4*v43
+    reg=a4v43
+    u41_plus = u41+a4v41
+    u42_plus = u42+a4v42
+    u43_plus = u43+a4v43
+    o41 = a4b4+u41_plus
+    o42 = o41+u42_plus
+    c4 = o42+u43_plus
+
+end

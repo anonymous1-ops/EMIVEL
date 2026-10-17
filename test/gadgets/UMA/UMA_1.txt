@@ -1,0 +1,16 @@
+gadget UMA_1
+	inputs a0:2,b0:2
+	outputs c0:2
+	randoms r0:1
+	noise 1
+	u0=a0&b0
+	u1=a1&b1
+	v0=u0^r0
+	v1=u1^r0
+
+	s0=a0&b1
+	s1=a1&b0
+
+	c0=v0^s0
+	c1=v1^s1
+end	

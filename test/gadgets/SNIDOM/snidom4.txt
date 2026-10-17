@@ -1,0 +1,159 @@
+gadget SNIDOM4
+    secrets a,b
+    inputs a1:6,b1:6
+    outputs c1:6
+    randoms ra1:5,rb1:5,r1:11
+    #field 2**1
+    #noise 0.5
+    #para 1
+    a1:=[ra1]
+    a2:=[ra2]
+    a3:=[ra3]
+    a4:=[ra4]
+    a5:=[a^a1^a2^a3^a4]
+
+    b1:=[rb1]
+    b2:=[rb2]
+    b3:=[rb3]
+    b4:=[rb4]
+    b5:=[b^b1^b2^b3^b4]
+
+    #r1=0
+    #r2=0
+    #r3=0
+    #r4=0
+    #r5=0
+    #r6=0
+    #r7=0
+    #r8=0
+    #r9=0
+    #r10=0
+
+    # AND
+    u11=a1&b1
+    u12=a1&b2
+    u13=a1&b3
+    u14=a1&b4
+    u15=a1&b5
+    u21=a2&b1
+    u22=a2&b2
+    u23=a2&b3
+    u24=a2&b4
+    u25=a2&b5
+    u31=a3&b1
+    u32=a3&b2
+    u33=a3&b3
+    u34=a3&b4
+    u35=a3&b5
+    u41=a4&b1
+    u42=a4&b2
+    u43=a4&b3
+    u44=a4&b4
+    u45=a4&b5
+    u51=a5&b1
+    u52=a5&b2
+    u53=a5&b3
+    u54=a5&b4
+    u55=a5&b5
+    reg=u12
+    reg=u13
+    reg=u14
+    reg=u15
+    reg=u21
+    reg=u23
+    reg=u24
+    reg=u25
+    reg=u31
+    reg=u32
+    reg=u34
+    reg=u35
+    reg=u41
+    reg=u42
+    reg=u43
+    reg=u45
+    reg=u51
+    reg=u52
+    reg=u53
+    reg=u54
+
+    # masking
+    v12=u12^r1
+    v21=u21^r1
+    v13=u13^r2
+    v31=u31^r2
+    v14=u14^r3
+    v41=u41^r3
+    v15=u15^r4
+    v51=u51^r4
+    v23=u23^r5
+    v32=u32^r5
+    v24=u24^r6
+    v42=u42^r6
+    v25=u25^r7
+    v52=u52^r7
+    v34=u34^r8
+    v43=u43^r8
+    v35=u35^r9
+    v53=u53^r9
+    v45=u45^r10
+    v54=u54^r10
+    reg=v12
+    reg=v13
+    reg=v14
+    reg=v15
+    reg=v21
+    reg=v23
+    reg=v24
+    reg=v25
+    reg=v31
+    reg=v32
+    reg=v34
+    reg=v35
+    reg=v41
+    reg=v42
+    reg=v43
+    reg=v45
+    reg=v51
+    reg=v52
+    reg=v53
+    reg=v54
+
+    # outputs
+    sum10=v12^v13
+    sum11=sum10^v14
+    sum12=sum11^v15
+    sum20=v21^v23
+    sum21=sum20^v24
+    sum22=sum21^v25
+    sum30=v31^v32
+    sum31=sum30^v34
+    sum32=sum31^v35
+    sum40=v41^v42
+    sum41=sum40^v43
+    sum42=sum41^v45
+    sum50=v51^v52
+    sum51=sum50^v53
+    sum52=sum51^v54
+    reg=sum12
+    reg=sum22
+    reg=sum32
+    reg=sum42
+    reg=sum52
+
+    final1=sum12^u11
+    final2=sum22^u22
+    final3=sum32^u33
+    final4=sum42^u44
+    final5=sum52^u55
+    reg = final1
+    reg = final2
+    reg = final3
+    reg = final4
+    reg = final5
+    c1=final1
+    c2=final2
+    c3=final3
+    c4=final4
+    c5=final5
+
+end
