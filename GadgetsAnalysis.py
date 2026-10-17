@@ -814,13 +814,6 @@ class CorrectnessVerifier:
         return True
 
 
-def _transition_then_glitch_channel(value, operand_channels, old_stable=(), barrier=False):
-    if barrier or not operand_channels:
-        return (value,) + tuple(old_stable)
-    current = dict.fromkeys(atom for channel in operand_channels for atom in channel)
-    return tuple(current) + tuple(old_stable)
-
-
 class LeakageAnalyzer:
     LEAKAGE_OPTIONS = (
         "maskverifTG",
@@ -829,9 +822,6 @@ class LeakageAnalyzer:
         "transition",
         "transitionall",
         "transitionxor",
-        "transition_then_glitch",
-        "transition_glitch_local",
-        "transition_stable_outputs",
         "hw_sumed",
         "hw_vector",
     )
@@ -915,9 +905,6 @@ class LeakageAnalyzer:
         for name, code in (
             ("maskverifTG", 9),
             ("ironmaskTG", 10),
-            ("transition_stable_outputs", 8),
-            ("transition_glitch_local", 7),
-            ("transition_then_glitch", 6),
         ):
             if name not in options:
                 continue
@@ -1311,7 +1298,7 @@ class LeakageAnalyzer:
         env, channels, protected = {}, {}, {}
         leakage, previous_history, last_old_stable = {}, {}, {}
         source_reads = set()
-        local_transition = robust in (6, 7, 8, 9, 10)
+        local_transition = robust in (9, 10)
         for value in encoding_values + initial_values:
             name = str(value)
             env[name] = value
@@ -1351,10 +1338,10 @@ class LeakageAnalyzer:
                 protected[rhs] = True
                 if local_transition:
                     channels[rhs] = (env[rhs],) + (
-                        last_old_stable.get(rhs, ()) if robust in (6, 10) else ()
+                        last_old_stable.get(rhs, ()) if robust == 10 else ()
                     )
                 continue
-            if robust not in (7, 8, 9) and row == output_rows.get(lhs):
+            if robust != 9 and row == output_rows.get(lhs):
                 row = lhs
             manual = tuple(self._evaluate(text, env) for text in instruction.extensions)
             for expression, text in zip(manual, instruction.extensions):
@@ -1393,18 +1380,16 @@ class LeakageAnalyzer:
                     raise ValueError(f"Line {row}: undefined variable {name}")
             old = (env[lhs],) if lhs in env else ()
             if local_transition:
-                if robust in (6, 10):
-                    history = _transition_then_glitch_channel(
-                        value, operand_channels, old, instruction.barrier
-                    )
+                current = (
+                    (value,)
+                    if not operand_channels or (robust == 10 and instruction.barrier)
+                    else tuple(dict.fromkeys(atom for channel in operand_channels for atom in channel))
+                )
+                if robust == 10:
+                    history = current + old
                     channels[lhs] = history
                     last_old_stable[lhs] = old
                 else:
-                    current = (
-                        _transition_then_glitch_channel(value, operand_channels)
-                        if robust in (7, 9)
-                        else (value,)
-                    )
                     history = tuple(dict.fromkeys(old + current))
                     channels[lhs] = (value,) if instruction.barrier else current
                 env[lhs] = value
@@ -1442,7 +1427,7 @@ class LeakageAnalyzer:
             if any(sympify(atom).free_symbols for atom in history):
                 leakage.setdefault(row, []).append(history)
 
-        if robust in (7, 8, 9):
+        if robust == 9:
             for name, row in output_rows.items():
                 endpoint = channels[name]
                 if any(sympify(atom).free_symbols for atom in endpoint):

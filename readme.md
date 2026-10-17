@@ -108,9 +108,6 @@ python EMIVEL.py -p test/ISW_2share.txt -cv AND -m probing_secret -t 1
 | Transition-all + Glitch | `-r transitionall glitch` |
 | Native maskVerif TG | `-r maskverifTG` |
 | Native IronMask TG | `-r ironmaskTG` |
-| Transition-then-glitch variant | `-r transition_then_glitch` |
-| Local transition/glitch variant | `-r transition_glitch_local` |
-| Stable-output transition variant | `-r transition_stable_outputs` |
 | Summed HW | `-r hw_sumed` |
 | Componentwise HW | `-r hw_vector` |
 | HW-XOR-Transition (sum) | `-r transitionxor hw_sumed` |
