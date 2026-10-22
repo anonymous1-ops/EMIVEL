@@ -1,9 +1,10 @@
 from contextlib import ExitStack
+from collections import Counter
 from copy import copy
 from fractions import Fraction
 from functools import cmp_to_key
-from itertools import combinations
-from math import comb, exp, gcd, log, log2, nextafter
+from itertools import combinations, product
+from math import comb, exp, gcd, log, log2, nextafter, prod
 from multiprocessing import Pool, cpu_count
 from re import escape, compile
 from tempfile import TemporaryFile
@@ -13,8 +14,9 @@ import time
 import psutil
 from sympy import symbols, flatten, Add, sympify, Integer, Mul, Symbol
 from sympy.logic.boolalg import Xor, Not
-from auxiliary import EncodedXor
+from auxiliary import EncodedXor, sympyGF2N, sympyGFp
 from GadgetsAnalysis import LeakageAnalyzer
+from Parameters import ObservationPlan
 import MIA
 
 _worker_instance = None
@@ -29,8 +31,16 @@ class Verifier:
         self.MIA = MIA.MIA(self)
         self._phase = "check"
         self._executing_task = False
-        self._request_results = {}
-        self._pending_requests = {}
+        self._request_results = None
+        self._pending_requests = None
+        self._unresolved_cache = {}
+        self._resource_process = None
+        self._static_cache = None
+        self._batch_units = {}
+        self._proof_only = False
+        self._symbolic_cache = {}
+        self._symbolic_serial = 0
+        self._substitution_steps = None
         self.MImatrix = {}
         self.leakage = []
         self.observation_cache = {}
@@ -70,6 +80,18 @@ class Verifier:
         if self.model_str in ["rpc", "rpe", "rps_secret", "rps_share"]:
             self.randomprobing = True
         self.tech = ("mi", "static", "both").index(self.gadget.checkOptions["tech."])
+        self._unresolved_cache = {}
+        self._static_cache = None if self.tech == 0 else {
+            "text": {}, "normalized": {}, "counts": {}, "costs": {}, "sources": ({}, {}),
+        }
+        self._batch_units = {}
+        self.__dict__.pop("_affine_prefix_state", None)
+        self.__dict__.pop("_symbolic_prefix_state", None)
+        self.__dict__.pop("_symbolic_prefix_plans", None)
+        self.__dict__.pop("_quadratic_proof_state", None)
+        self._symbolic_cache = {}
+        self._symbolic_serial = 0
+        self._substitution_steps = None
         if self.tech == 0 or self.tech == 2:
             self.MIA.initialize()
         self.HW = "hw_sumed" in robust or "hw_vector" in robust
@@ -81,12 +103,12 @@ class Verifier:
         self.abort = {"f": False, "t": True}[self.gadget.checkOptions["abort"]]
         self.detail = {"f": False, "t": True}[self.gadget.checkOptions["detail"]]
         watch = set(map(str, self.gadget.checkOptions.get("watch", ())))
-        self._live_detail = self.event is not None and (self.detail or bool(watch))
+        self._live_detail = (
+            not self.randomprobing and self.event is not None and (self.detail or bool(watch))
+        )
         self._watch_locations = set()
         if self._live_detail and watch:
             locations = set(getattr(self.gadget, "probe_locations", {}).values())
-            if self.randomprobing:
-                locations.update(getattr(self.gadget, "random_wire_locations", ()))
             matched = set()
             for location in locations:
                 row, lhs = location
@@ -111,7 +133,7 @@ class Verifier:
         self.OutputProbe = self.gadget.observationsOutput
         self.row2Probe = self.gadget.mapRow2Obs
         self.randoms = self.gadget.randoms
-        self.compiled_patterns_random = {
+        self.compiled_patterns_random = {} if self.tech == 0 else {
             random: compile(f"(?<!\\w){escape(random)}(?!\\w)")
             for random in map(str, self.randoms)
         }
@@ -140,6 +162,9 @@ class Verifier:
             self.len_shares_set // self.bits_sharesNum
             if self.len_secrets == 0
             else self.len_secrets
+        )
+        self._empty_rpe_indices = (
+            tuple(() for _ in range(self.len_secrets)) if self.randomprobing else ()
         )
         sharesOut = self.gadget.secretsOutputs
         sharesOutBits = self.gadget.secretsOutputsBits
@@ -177,12 +202,40 @@ class Verifier:
             symbol: (self.funcMapping[position], self.funcMapping_index[position])
             for (symbol, position) in self.shares.items()
         }
+        positions = {
+            location: 1 << index
+            for index, location in enumerate(dict.fromkeys(self._share_locations.values()))
+        }
+        self._share_bits = {symbol: positions[location] for symbol, location in self._share_locations.items()}
+        self._family_bits = tuple(
+            sum(bit for (family, _), bit in positions.items() if family == index)
+            for index in range(self.len_secrets)
+        )
+        self._index_bits = {
+            index: 1 << position
+            for position, index in enumerate(sorted({index for _, index in positions}))
+        }
 
     def __getstate__(self):
         state = self.__dict__.copy()
         state["event"] = None
-        state["_request_results"] = {}
-        state["_pending_requests"] = {}
+        state["_request_results"] = None
+        state["_pending_requests"] = None
+        state["_unresolved_cache"] = {}
+        state["_resource_process"] = None
+        state["_batch_units"] = {}
+        state.pop("_affine_prefix_state", None)
+        state.pop("_prefix_witness", None)
+        state.pop("_symbolic_prefix_state", None)
+        state.pop("_symbolic_prefix_plans", None)
+        state.pop("_quadratic_proof_state", None)
+        state["_symbolic_cache"] = {}
+        state["_symbolic_serial"] = 0
+        state["_substitution_steps"] = None
+        if state["_static_cache"] is not None:
+            state["_static_cache"] = {
+                "text": {}, "normalized": {}, "counts": {}, "costs": {}, "sources": ({}, {}),
+            }
         state["_watch_locations"] = set()
         circuit = copy(self.gadget)
         circuit.instructions = ()
@@ -191,6 +244,10 @@ class Verifier:
         circuit.__dict__.pop("random_wire_locations", None)
         state["gadget"] = circuit
         quantifier = copy(self.MIA)
+        quantifier._affine_cache = {}
+        quantifier._evaluation_cache = {}
+        quantifier._conditioning_cache = None
+        quantifier._reuse_evaluation = False
         quantifier.gadget = circuit
         if getattr(quantifier.model, "__self__", None) is self.MIA:
             quantifier.model = quantifier.model.__func__.__get__(quantifier, type(quantifier))
@@ -202,6 +259,9 @@ class Verifier:
         self._check_stop_reason = None
         self._result_counts = {"safe": 0, "insecure": 0, "unknown": 0}
         start_time = time.time()
+        self._batching = False
+        self._batch_units = {}
+        self._random_wire_groups = ()
         if self.randomprobing:
             self._initialize_random_statistics()
             size = len(self.gadget.observationsIn)
@@ -218,6 +278,37 @@ class Verifier:
         else:
             total = self.checksize
             tasks = ((0, item, None, None) for item in self.checklist)
+        if self.randomprobing and not self.abort and not self._live_detail:
+            classes = {}
+            for position, value in enumerate(self.gadget.observationsIn):
+                classes.setdefault(value, []).append(position)
+            if len(classes) < size:
+                self._random_wire_groups = tuple(tuple(group) for group in classes.values())
+                self._batching = True
+                tasks = (
+                    (order, item, None, None, (selection, weight))
+                    for order, item, selection, weight in ObservationPlan(wires, orders).weighted(
+                        self._random_wire_groups
+                    )
+                )
+                if self.tech != 0:
+                    tasks = (
+                        (order, prefix, members, "weighted_family")
+                        for order, prefix, members in ObservationPlan(wires, orders).batches(
+                            maximum=32, groups=self._random_wire_groups
+                        )
+                    )
+        if (
+            self.tech != 0 and not self.abort and not self._watch_locations
+            and not self._random_wire_groups
+        ):
+            plan = ObservationPlan(range(size), orders) if self.randomprobing else self.checklist
+            if isinstance(plan, ObservationPlan) and not plan.flatten:
+                self._batching = True
+                tasks = (
+                    (order, prefix, tails, "family")
+                    for order, prefix, tails in plan.batches(maximum=24, tail_order=2)
+                )
         with ExitStack() as resources:
             pool = None
             if self.mcore > 0:
@@ -238,14 +329,18 @@ class Verifier:
             if self.tech == 2 and (not self.abort):
                 with TemporaryFile(mode="w+b") as pending:
                     self._phase = "static"
-                    pending_count = self._process_observations(
+                    pending_count, pending_weight = self._process_observations(
                         tasks, total, start_time, spool=pending, pool=pool
                     )
                     if pending_count and self._check_stop_reason is None:
                         pending.seek(0)
                         self._phase = "mi"
-                        tasks = (pickle.load(pending) for _ in range(pending_count))
-                        self._process_observations(tasks, pending_count, start_time, pool=pool)
+                        tasks = (
+                            task
+                            for _ in range((pending_count + 127) // 128)
+                            for task in pickle.load(pending)
+                        )
+                        self._process_observations(tasks, pending_weight, start_time, pool=pool)
             else:
                 self._phase = "check"
                 self._process_observations(tasks, total, start_time, pool=pool)
@@ -267,8 +362,8 @@ class Verifier:
             "checksize": self.checksize,
             "stop_reason": self._check_stop_reason,
             "counts": counts,
-            "independence_decision": "static_proof_or_exact_integer_counts",
-            "mi_numeric": "floating_point_from_exhaustive_counts",
+            "independence_decision": "static_proof_or_exact_integer_counts_or_finite_field_ranks",
+            "mi_numeric": "finite_precision_from_exact_counts_or_finite_field_ranks",
             "mi_normalization": self.MIA.MI_norm,
             "xor_encoding": "bitwise_integer",
             "aggregation": "positive_numeric_mi_only",
@@ -309,33 +404,109 @@ class Verifier:
 
     def _process_observations(self, tasks, total, start_time, pool=None, spool=None):
         pending_count = 0
+        pending_weight = 0
+        pending_block = []
+
+        def members(packets):
+            for packet in packets:
+                for result in packet.get("family_results", (packet,)):
+                    if (
+                        "wire_group_counts" not in result or result.get("verify", True)
+                        or not result.get("processed", True) or "deferred" in result
+                        or result["batch_count"] == 1
+                    ):
+                        yield result
+                        continue
+                    selection = result["wire_group_counts"]
+                    group, count = selection[0]
+                    stack = [iter(combinations(self._random_wire_groups[group], count))]
+                    blocks = []
+                    while stack:
+                        try:
+                            block = next(stack[-1])
+                        except StopIteration:
+                            stack.pop()
+                            if blocks:
+                                blocks.pop()
+                            continue
+                        if len(stack) < len(selection):
+                            blocks.append(block)
+                            group, count = selection[len(stack)]
+                            stack.append(iter(combinations(self._random_wire_groups[group], count)))
+                            continue
+                        reason = self._limit_reason(start_time)
+                        if reason:
+                            yield {"processed": False, "abort": None, "stop_reason": reason}
+                            return
+                        row = tuple(sorted(wire for part in (*blocks, block) for wire in part))
+                        sampled = [self.gadget.observationsIn[wire] for wire in row]
+                        member = {
+                            key: value for key, value in result.items()
+                            if key not in ("wire_group_counts", "batch_count")
+                        }
+                        member["row"] = member["wire_indices"] = row
+                        member["requests"] = [
+                            {**check, "leakage": sampled + check["leakage"][result["Ci"]:]}
+                            if check["failed"] else check
+                            for check in result["requests"]
+                        ]
+                        yield member
+
         if self.event is not None:
             self.event("progress_start", {"total": total, "phase": self._phase})
         try:
             if pool is not None:
-                chunksize = 1 if self.abort else min(5000, max(1, total // (self.mcore * 200)))
+                chunksize = (
+                    1 if self.abort or self._random_wire_groups else
+                    min(64, max(1, total // (self.mcore * 12800)))
+                    if self._batching and self._phase != "mi" else
+                    min(5000, max(1, total // (self.mcore * 200)))
+                )
                 phase = self._phase
                 work = ((phase, task) for task in tasks)
                 results = pool.imap_unordered(
                     Verifier._check_observation_worker, work, chunksize=chunksize
                 )
+            elif self._phase == "check" and not self.randomprobing and (
+                self.tech == 0 or self.abort or self._watch_locations
+                or not isinstance(self.checklist, ObservationPlan) or self.checklist.flatten
+            ):
+                results = (
+                    self.verify_observation(item, start_time)
+                    for _, item, _, _ in tasks
+                )
             else:
                 results = (self._check_task(task, start_time) for task in tasks)
-            for result in results:
+            for result in members(results):
                 if "deferred" in result:
-                    pickle.dump(result["deferred"], spool, protocol=pickle.HIGHEST_PROTOCOL)
+                    task = result["deferred"]
+                    for key, residual in task[3].items():
+                        retained = self._unresolved_cache.get(key)
+                        if retained is None:
+                            if len(self._unresolved_cache) >= 4096:
+                                self._unresolved_cache.clear()
+                            self._unresolved_cache[key] = residual
+                        else:
+                            task[3][key] = retained
+                    pending_block.append(task)
+                    if len(pending_block) == 128:
+                        pickle.dump(tuple(pending_block), spool, protocol=pickle.HIGHEST_PROTOCOL)
+                        pending_block.clear()
                     pending_count += 1
+                    pending_weight += result.get("batch_count", 1)
                 self._record_result(result)
                 if self.event is not None and result.get("processed", True):
-                    self.event("progress", {"advance": 1})
+                    self.event("progress", {"advance": result.get("batch_count", 1)})
                 if result["abort"] is None:
                     if pool is not None:
                         pool.terminate()
                     break
+            if pending_block:
+                pickle.dump(tuple(pending_block), spool, protocol=pickle.HIGHEST_PROTOCOL)
         finally:
             if self.event is not None:
                 self.event("progress_end", {})
-        return pending_count
+        return pending_count, pending_weight
 
     @staticmethod
     def _init_worker(instance, start_time=None, field_order=None):
@@ -355,10 +526,19 @@ class Verifier:
         return _worker_instance._check_task(task, _worker_start_time)
 
     def _check_task(self, task, start_time):
-        order, item, completed, pending = task
+        order, item, completed, pending = task[:4]
+        weighting = task[4] if len(task) == 5 else None
+        if pending in ("family", "weighted_family"):
+            return self._check_family(
+                order, item, completed, start_time, weighted=pending == "weighted_family"
+            )
         self.Ci = order
-        self._request_results = completed or {}
-        self._pending_requests = pending or {}
+        self._request_results = completed if completed is not None else (
+            {} if self._phase != "check" or self.model_str in ("rpc", "rpe") else None
+        )
+        self._pending_requests = pending if pending is not None else (
+            {} if self._phase == "static" else None
+        )
         self._executing_task = True
         try:
             indexed = self.randomprobing
@@ -371,6 +551,8 @@ class Verifier:
             if indexed:
                 result["wire_indices"] = item
                 result["row"] = tuple(item)
+            if weighting is not None:
+                result["wire_group_counts"], result["batch_count"] = weighting
             if self._phase == "static" and self._pending_requests:
                 resolved = {
                     key: value
@@ -378,23 +560,291 @@ class Verifier:
                     if key not in self._pending_requests
                 }
                 result["deferred"] = (order, item, resolved, self._pending_requests)
+                if weighting is not None:
+                    result["deferred"] += (weighting,)
             return result
         finally:
             self._executing_task = False
-            self._request_results = {}
-            self._pending_requests = {}
+            self._request_results = None
+            self._pending_requests = None
+
+    def _check_family(self, order, prefix, tails, start_time, weighted=False):
+        population = self.gadget.observationsIn if self.randomprobing else self.checklist.population
+        proofs = {} if self.randomprobing and self.model_str == "rpc" else None
+
+        def member(indices):
+            weighting = ()
+            if weighted:
+                item, selection, weight = tails[indices[0]]
+                weighting = ((selection, weight),)
+            else:
+                item = indices if self.randomprobing else tuple(population[i] for i in indices)
+            completed = None
+            if proofs:
+                sampled = frozenset(population[index] for index in item)
+                completed = {}
+                for outputs, certificates in proofs.items():
+                    channel = sampled | outputs
+                    for certified, result in certificates:
+                        if channel <= certified:
+                            completed["random", self.model_str, self.t, self.tech, channel] = result
+                            break
+            return self._check_task(
+                (order if self.randomprobing else 0, item, completed, None) + weighting,
+                start_time,
+            )
+
+        if not tails:
+            return {"family_results": [member(prefix)]}
+
+        def unit(position):
+            if weighted:
+                return (
+                    (order, order, 0, frozenset()),
+                    tuple(population[wire] for wire in tails[position][0]),
+                )
+            cached = self._batch_units.get(position)
+            if cached is None:
+                if self.randomprobing:
+                    cached = ((1, 1, 0, frozenset()), (population[position],))
+                else:
+                    self._reset_observation()
+                    self.O = (population[position],)
+                    self._prepare_observation()
+                    cached = (
+                        (self.probe_count, self.t_in, self.t_out, frozenset(self.O_outIndex)),
+                        tuple(self.P),
+                    )
+                if len(self._batch_units) >= 8192:
+                    self._batch_units.clear()
+                self._batch_units[position] = cached
+            return cached
+
+        prefix_units = [unit(position) for position in prefix]
+        prefix_probes = tuple(value for item in prefix_units for value in item[1])
+        blocks = (
+            ((1, tuple(range(len(tails)))),) if weighted else
+            tails if isinstance(tails[0], tuple) else ((1, tails),)
+        )
+        partitions = []
+        for take, positions in blocks:
+            groups = {}
+            for position in positions:
+                signature, values = unit(position)
+                groups.setdefault(signature, []).append((position, values))
+            choices = []
+            entries = list(groups.items())
+            for first, (signature, selected) in enumerate(entries):
+                if len(selected) >= take:
+                    choices.append(((take, tuple(selected), signature),))
+                if take == 2:
+                    for other_signature, other in entries[first + 1:]:
+                        choices.append((
+                            (1, tuple(selected), signature),
+                            (1, tuple(other), other_signature),
+                        ))
+            partitions.append(choices)
+        results = []
+        for partition in product(*partitions):
+            grouped = tuple(block for part in partition for block in part)
+            context = (
+                *(
+                    sum(item[0][i] for item in prefix_units)
+                    + sum(take * signature[i] for take, _, signature in grouped)
+                    for i in range(3)
+                ),
+                frozenset().union(
+                    *(item[0][3] for item in prefix_units),
+                    *(signature[3] for _, _, signature in grouped),
+                ),
+            )
+            stack = [grouped]
+            attempts = min(10, max(2, sum(len(items) for _, items, _ in grouped).bit_length()))
+            while stack:
+                batch = stack.pop()
+                count = prod(comb(len(items), take) for take, items, _ in batch)
+                reason = self._limit_reason(start_time)
+                if reason:
+                    results.append({"processed": False, "abort": None, "stop_reason": reason})
+                    return {"family_results": results}
+                checks = None
+                if count > 1 and attempts:
+                    attempts -= 1
+                    probes = prefix_probes + tuple(
+                        value for _, items, _ in batch for _, values in items for value in values
+                    )
+                    self._reset_observation()
+                    self.probe_count, self.t_in, self.t_out, output_indices = context
+                    self.O_outIndex = set(output_indices)
+                    checks = self._prove_family(probes, proofs)
+                    if checks is None and count >= 8 and attempts:
+                        accepted = [list(items[:take]) for take, items, _ in batch]
+                        additions = [
+                            (block, entry)
+                            for block, (take, items, _) in enumerate(batch)
+                            for entry in items[take:]
+                        ]
+                        attempts -= 1
+                        probes = prefix_probes + tuple(
+                            value for items in accepted for _, values in items for value in values
+                        )
+                        self._reset_observation()
+                        self.probe_count, self.t_in, self.t_out, output_indices = context
+                        self.O_outIndex = set(output_indices)
+                        checks = self._prove_family(probes, proofs)
+                        if checks is not None:
+                            pending = [additions] if additions else []
+                            while pending and attempts:
+                                chunk = pending.pop()
+                                reason = self._limit_reason(start_time)
+                                if reason:
+                                    results.append({"processed": False, "abort": None, "stop_reason": reason})
+                                    return {"family_results": results}
+                                attempts -= 1
+                                probes = prefix_probes + tuple(
+                                    value for items in accepted for _, values in items for value in values
+                                ) + tuple(value for _, (_, values) in chunk for value in values)
+                                self._reset_observation()
+                                self.probe_count, self.t_in, self.t_out, output_indices = context
+                                self.O_outIndex = set(output_indices)
+                                extended = self._prove_family(probes, proofs)
+                                if extended is not None:
+                                    checks = extended
+                                    for block, entry in chunk:
+                                        accepted[block].append(entry)
+                                elif len(chunk) > 1:
+                                    middle = len(chunk) // 2
+                                    pending.extend((chunk[middle:], chunk[:middle]))
+                            safe_blocks = []
+                            residuals = []
+                            for (take, items, signature), good in zip(batch, accepted):
+                                included = {position for position, _ in good}
+                                bad = tuple(entry for entry in items if entry[0] not in included)
+                                good = tuple(good)
+                                safe_blocks.append((take, good, signature))
+                                options = []
+                                for good_count in range(max(0, take - len(bad)), min(take, len(good)) + 1):
+                                    parts = ()
+                                    if good_count:
+                                        parts += ((good_count, good, signature),)
+                                    if take > good_count:
+                                        parts += ((take - good_count, bad, signature),)
+                                    options.append((good_count == take, parts))
+                                residuals.append(options)
+                            for parts in product(*residuals):
+                                if not all(complete for complete, _ in parts):
+                                    stack.append(tuple(block for _, part in parts for block in part))
+                            batch = tuple(safe_blocks)
+                            count = prod(comb(len(items), take) for take, items, _ in batch)
+                if checks is not None:
+                    packet = {
+                        "processed": True, "abort": False, "verify": True,
+                        "status": "safe", "mi": 0, "mi_text": None, "exact_zero": True,
+                        "choice_rpe": (), "rpe_input_indices": (), "leakage": [],
+                        "Ci": order if self.randomprobing else -1,
+                        "batch_count": count, "requests": checks,
+                    }
+                    if weighted:
+                        packet["family_weighted"] = tuple(tails[position] for position, _ in batch[0][1])
+                        packet["batch_count"] = sum(item[2] for item in packet["family_weighted"])
+                    else:
+                        packet["family_prefix"] = prefix
+                        packet["family_blocks"] = tuple(
+                            (take, tuple(position for position, _ in items)) for take, items, _ in batch
+                        )
+                    results.append(packet)
+                    continue
+                for selected in product(*(combinations(items, take) for take, items, _ in batch)):
+                    indices = tuple(sorted((*prefix, *(position for items in selected for position, _ in items))))
+                    result = member(indices)
+                    results.append(result)
+                    if result["abort"] is None:
+                        return {"family_results": results}
+        return {"family_results": results}
+
+    def _prove_family(self, probes, proofs=None):
+        def prove(outputs):
+            values = tuple(self.OutputProbe[output] for output in outputs)
+            self.P = list(dict.fromkeys((*probes, *values)))
+            if proofs is not None:
+                output_key = frozenset(values)
+                original = frozenset(self.P)
+                for certified, result in proofs.get(output_key, ()):
+                    if original <= certified:
+                        return result
+            self.P_channel_count = None
+            self.choice_rpe = ()
+            self._prefix_witness = None
+            safe = (
+                self._test_security() or self._prove_affine_prefix()
+                or self._prove_symbolic_prefix()
+            )
+            if not safe and len(self.P) <= 8:
+                safe = self.simplify()
+            if not safe:
+                return None
+            witness = self._prefix_witness
+            if witness is None:
+                required = [set() for _ in range(self.len_secrets)]
+                for expression in self.P:
+                    for symbol in expression.free_symbols & self.shares_set:
+                        family, index = self._share_locations[symbol]
+                        required[family].add(index)
+                witness = tuple(tuple(sorted(indices)) for indices in required)
+            result = {
+                "mi": 0, "mi_text": None, "exact_zero": True,
+                "choice_rpe": (), "rpe_input_indices": witness,
+                "unknown": False, "failed": False, "leakage": [],
+            }
+            if proofs is not None:
+                retained = [
+                    certificate for certificate in proofs.get(output_key, ())
+                    if not certificate[0] <= original
+                ]
+                proofs[output_key] = [(original, result)] + retained[:7]
+            return result
+
+        self._proof_only = True
+        try:
+            if not self.randomprobing or self.model_str in ("rps_secret", "rps_share"):
+                result = prove(())
+                return [result] if result is not None else None
+            checks = []
+            for request in self.rp_requests:
+                if self.model_str == "rpc":
+                    result = prove(request)
+                else:
+                    result = None
+                    for outputs in request["choices"]:
+                        result = prove(outputs)
+                        if result is not None:
+                            result["output_choice"] = tuple(map(str, outputs))
+                            result["event_failures"] = [
+                                {"inputs": event, "lower": False, "upper": False}
+                                for event in self.rp_events
+                            ]
+                            break
+                if result is None:
+                    return None
+                checks.append(result)
+            return checks
+        finally:
+            self._proof_only = False
 
     def _limit_reason(self, start_time):
         if start_time is not None and time.time() - start_time >= self.max_hours * 3600:
             return "Time limit reached"
-        if psutil.Process(os.getpid()).memory_info().rss / 1024**3 > self.max_mem:
+        process = self._resource_process
+        if process is None or process.pid != os.getpid():
+            process = self._resource_process = psutil.Process()
+        if process.memory_info().rss / 1024**3 > self.max_mem:
             return "Memory limit reached"
         return None
 
     def verify_observation(self, item, start_time=None):
         if not self._executing_task:
-            self._request_results = {}
-            self._pending_requests = {}
+            self._request_results = {} if self.model_str in ("rpc", "rpe") else None
+            self._pending_requests = None
             self._phase = "check"
         if self.randomprobing:
             return self._check_random_observation(item, start_time)
@@ -495,8 +945,9 @@ class Verifier:
         self.row = row
         if not self.P:
             raise RuntimeError("Error in O2p.")
-        probes = self.P if self.HW else set(self.P)
-        cache = tuple(sorted(map(str, probes)))
+        cache = (
+            "multiplicity", frozenset(Counter(self.P).items())
+        ) if self.HW else ("values", frozenset(self.P))
         if self.model_str in ("ni", "sni", "pini"):
             cache += (
                 (
@@ -513,7 +964,7 @@ class Verifier:
 
     def _evaluate_probes(self, cache):
         completed = self._request_results
-        if cache in completed:
+        if completed is not None and cache in completed:
             result = completed[cache]
         elif cache in self.observation_cache and cache in self.exact_zero_cache:
             result = {
@@ -521,7 +972,7 @@ class Verifier:
                 "exact_zero": self.exact_zero_cache[cache],
                 "mi_text": self.mi_text_cache.get(cache),
                 "choice_rpe": self.choice_rpe_cache.get(cache, ()),
-                "rpe_input_indices": self.rpe_witness_cache.get(cache, ()),
+                "rpe_input_indices": self.rpe_witness_cache.get(cache, self._empty_rpe_indices),
             }
         else:
             mi_text = None
@@ -533,11 +984,26 @@ class Verifier:
                 self.choice_rpe = choice
                 self.rpe_input_indices = witness
                 safe = False
+            elif phase == "static" and cache in self._unresolved_cache:
+                probes, channel_count, choice, witness = self._unresolved_cache[cache]
+                self.P = list(probes)
+                self.P_channel_count = channel_count
+                self.choice_rpe = choice
+                self.rpe_input_indices = witness
+                safe = False
             elif self.tech == 0:
                 safe = False
             else:
                 componentwise_hw = "hw_vector" in self.gadget.checkOptions["robust"]
-                safe = self.simplify(preserve_layout=self.HW, componentwise_hw=componentwise_hw)
+                self._prefix_witness = None
+                safe = (
+                    self._test_security() or self._prove_affine_prefix()
+                    or self._prove_symbolic_prefix()
+                )
+                if not safe:
+                    safe = self.simplify(preserve_layout=self.HW, componentwise_hw=componentwise_hw)
+                if not safe:
+                    safe = self._prove_quadratic_masks()
                 if self.HW:
                     channel_count = getattr(self, "P_channel_count", None)
                     if channel_count is None:
@@ -564,20 +1030,28 @@ class Verifier:
                             needed[self.funcMapping[position]].add(
                                 self.funcMapping_index[position]
                             )
-                    self.rpe_input_indices = tuple(
-                        (tuple(sorted(indices)) for indices in needed)
+                    self.rpe_input_indices = (
+                        self._prefix_witness if safe and self._prefix_witness is not None else
+                        tuple(tuple(sorted(indices)) for indices in needed)
                     )
             if safe:
+                self.choice_rpe = ()
                 mi, exact_zero = (0, True)
             elif self.tech == 1 or phase == "static":
                 mi, exact_zero = (-1, None)
                 if phase == "static":
-                    self._pending_requests[cache] = (
-                        tuple(self.P),
-                        self.P_channel_count,
-                        self.choice_rpe,
-                        getattr(self, "rpe_input_indices", ()),
-                    )
+                    residual = self._unresolved_cache.get(cache)
+                    if residual is None:
+                        residual = (
+                            tuple(self.P),
+                            self.P_channel_count,
+                            self.choice_rpe,
+                            getattr(self, "rpe_input_indices", ()),
+                        )
+                        if len(self._unresolved_cache) >= 4096:
+                            self._unresolved_cache.clear()
+                        self._unresolved_cache[cache] = residual
+                    self._pending_requests[cache] = residual
             else:
                 if self.model_str == "rpe":
                     self.choice_rpe = ()
@@ -596,10 +1070,13 @@ class Verifier:
             if not (phase == "static" and exact_zero is None):
                 self.observation_cache[cache] = mi
                 self.exact_zero_cache[cache] = exact_zero
-                self.mi_text_cache[cache] = mi_text
-                self.choice_rpe_cache[cache] = self.choice_rpe
-                self.rpe_witness_cache[cache] = result["rpe_input_indices"]
-        completed[cache] = result
+                if mi_text is not None:
+                    self.mi_text_cache[cache] = mi_text
+                if self.model_str == "rpe":
+                    self.choice_rpe_cache[cache] = self.choice_rpe
+                    self.rpe_witness_cache[cache] = result["rpe_input_indices"]
+        if completed is not None:
+            completed[cache] = result
         self.choice_rpe = result["choice_rpe"]
         self.rpe_input_indices = result["rpe_input_indices"]
         self.mi = result["mi"]
@@ -617,11 +1094,16 @@ class Verifier:
         if self.randomprobing:
             self._aggregate_random_result(result)
         else:
+            if "batch_count" in result:
+                self._result_counts["safe"] += result["batch_count"]
+                self.processed_count += result["batch_count"]
+                return
             cache = result["cache"]
-            self.observation_cache[cache] = result["mi"]
-            self.exact_zero_cache[cache] = result["exact_zero"]
-            self.mi_text_cache[cache] = result.get("mi_text")
-            self.choice_rpe_cache[cache] = result["choice_rpe"]
+            if self.mcore > 0:
+                self.observation_cache[cache] = result["mi"]
+                self.exact_zero_cache[cache] = result["exact_zero"]
+                if result.get("mi_text") is not None:
+                    self.mi_text_cache[cache] = result["mi_text"]
             status = result["status"]
             self._result_counts[status] += 1
             if not result["verify"]:
@@ -633,85 +1115,551 @@ class Verifier:
                 self.leakage.extend(result["leakage"])
         if self._live_detail and (not result["verify"] or self._watch_locations):
             locations = self.gadget.probe_locations
-            if self.randomprobing:
-                sampled = tuple(
-                    self.gadget.random_wire_locations[index] for index in result["wire_indices"]
+            current = tuple(locations[probe] for probe in result["row"])
+            if (self.detail and result["status"] != "safe") or self._watch_locations.intersection(
+                current
+            ):
+                self.event(
+                    "detail",
+                    {
+                        "locations": current,
+                        "status": result["status"],
+                        "mi": None if self.tech == 1 or result["mi"] < 0 else result["mi"],
+                        "mi_text": result.get("mi_text"),
+                        "quantity": "MI" if self.model_str == "probing_secret" else "CMI",
+                    },
                 )
-                checks = enumerate(result["requests"], 1)
-            else:
-                sampled = tuple(locations[probe] for probe in result["row"])
-                checks = ((None, result),)
-            for request, check in checks:
-                current = sampled
-                if self.randomprobing:
-                    outputs = (
-                        self.rp_requests[request - 1]
-                        if self.model_str == "rpc"
-                        else check.get("output_choice", ())
-                    )
-                    current += tuple(locations[symbols(str(output))] for output in outputs)
-                    status = (
-                        "unknown"
-                        if check["unknown"]
-                        else "insecure" if check["failed"] else "safe"
-                    )
-                else:
-                    status = check["status"]
-                if (self.detail and status != "safe") or self._watch_locations.intersection(
-                    current
-                ):
-                    self.event(
-                        "detail",
-                        {
-                            "locations": current,
-                            "status": status,
-                            "mi": None if self.tech == 1 or check["mi"] < 0 else check["mi"],
-                            "mi_text": check.get("mi_text"),
-                            "quantity": "MI" if self.model_str in ("probing_secret", "rps_secret") else "CMI",
-                            "request": request,
-                            "wire_indices": result.get("wire_indices"),
-                        },
-                    )
-        self.processed_count += 1
+        self.processed_count += result.get("batch_count", 1)
+
+    def _symbolic_info(self, expression):
+        info = self._symbolic_cache.get(expression)
+        if info is None:
+            shares = indices = 0
+            sources = expression.free_symbols
+            for symbol in sources & self.shares_set:
+                shares |= self._share_bits[symbol]
+                indices |= self._index_bits[self._share_locations[symbol][1]]
+            self._symbolic_serial += 1
+            info = (self._symbolic_serial, shares, indices)
+            if len(self._symbolic_cache) >= 8192:
+                self._symbolic_cache.clear()
+            self._symbolic_cache[expression] = info
+        return info
 
     def _test_security(self):
         model = self.model_str
+        shares = indices = 0
+        for value in self.P:
+            info = self._symbolic_info(value)
+            shares |= info[1]
+            indices |= info[2]
+            if shares and model in ("probing_secret", "rps_secret"):
+                return False
         if model in ("probing_secret", "rps_secret"):
-            return all((not value.free_symbols & self.shares_set for value in self.P))
-        if model == "pini":
-            needed = set()
-            for value in self.P:
-                needed.update(
-                    (
-                        self._share_locations[symbol][1]
-                        for symbol in value.free_symbols & self.shares_set
-                    )
-                )
-                if len(needed - self.O_outIndex) > self.t_in:
-                    return False
             return True
+        if model == "pini":
+            allowed = 0
+            for index in self.O_outIndex:
+                allowed |= self._index_bits.get(index, 0)
+            return (indices & ~allowed).bit_count() <= self.t_in
+        budget = (
+            self.probe_count if model == "ni" else self.t_in if model == "sni"
+            else self.shareNum - 1 if model in ("probing_share", "rps_share") else self.t
+        )
+        if model == "rpe":
+            self.choice_rpe = tuple(
+                index for index, family in enumerate(self._family_bits)
+                if (shares & family).bit_count() > budget
+            )
+            return not self.choice_rpe
+        return all((shares & family).bit_count() <= budget for family in self._family_bits)
+
+    def _prove_symbolic_prefix(self):
+        self._prefix_witness = None
+        state = getattr(self, "_symbolic_prefix_state", None)
+        if state is None or not self.P or len(self.P) > 64:
+            return False
+        observations = tuple(self.P)
+        first = observations[0]
+        if first != state["first"]:
+            plans = getattr(self, "_symbolic_prefix_plans", {})
+            state = plans.get(first)
+            if state is None:
+                return False
+            plans.pop(first)
+            plans[first] = state
+            self._symbolic_prefix_state = state
+        signature = (None if self.logic else self.GF_field, tuple(self.randoms), frozenset(self.shares_set))
+        if state["signature"] != signature:
+            return False
+        transformed = observations
+        try:
+            for substitution, cache in zip(state["steps"], state["caches"]):
+                if len(cache) >= 256:
+                    cache.clear()
+                output = []
+                for expression in transformed:
+                    if expression not in cache:
+                        rebuilt = {}
+                        pending = [(expression, False)]
+                        while pending:
+                            node, ready = pending.pop()
+                            if node in rebuilt:
+                                continue
+                            if len(rebuilt) > 512:
+                                return False
+                            if node in substitution:
+                                rebuilt[node] = substitution[node]
+                            elif not node.args:
+                                rebuilt[node] = node
+                            elif not ready:
+                                pending.append((node, True))
+                                pending.extend((arg, False) for arg in node.args)
+                            else:
+                                args = tuple(rebuilt[arg] for arg in node.args)
+                                rebuilt[node] = (
+                                    node if args == node.args else
+                                    node.func(*args) if self.logic or node.func is EncodedXor else
+                                    node.func(*args, evaluate=False)
+                                )
+                        value = rebuilt[expression]
+                        cache[expression] = (
+                            self._normalize_boolean(value, self._static_cache["normalized"])
+                            if self.logic else state["evaluator"].evaluate(value)
+                        )
+                    output.append(cache[expression])
+                transformed = tuple(output)
+            if transformed == observations:
+                return False
+            return self._prove_affine_prefix(transformed)
+        except (TypeError, ValueError, NotImplementedError):
+            return False
+
+    def _prove_affine_prefix(self, probes=None):
+        self._prefix_witness = None
+        observations = tuple(self.P if probes is None else probes)
+        field = None if self.logic else self.GF_field
+        signature = (field, tuple(self.randoms))
+        state = getattr(self, "_affine_prefix_state", None)
+        if state is None or state["signature"] != signature:
+            masks = {
+                symbols(mask) if isinstance(mask, str) else mask: index
+                for index, mask in enumerate(self.randoms)
+            }
+            state = {
+                "signature": signature,
+                "masks": masks,
+                "cache": {},
+                "products": {},
+                "inverses": {1: 1},
+                "observations": (),
+                "blocked": None,
+                "pivots": [],
+                "residuals": [],
+                "checkpoints": [(0, 0)],
+                "prefixes": {},
+                "prefix_key": None,
+            }
+            self._affine_prefix_state = state
+        masks = state["masks"]
+        cache = state["cache"]
+        q = 2 if self.logic else int(field.order)
+        binary = self.logic or field.characteristic == 2
+        if not binary and field.degree != 1:
+            return False
+        products = state["products"]
+
+        def multiply(left, right):
+            if not binary:
+                return left * right % q
+            if not left or not right:
+                return 0
+            if left == 1:
+                return right
+            if right == 1:
+                return left
+            key = (left, right) if left <= right else (right, left)
+            value = products.get(key)
+            if value is None:
+                value = int(field(left) * field(right))
+                if len(products) >= 4096:
+                    products.clear()
+                products[key] = value
+            return value
+
+        rows = []
+        blocked = masks.keys() & self.shares_set
+        for expression in observations:
+            decomposition = cache.get(expression)
+            if decomposition is None:
+                row = {}
+                pending = [(expression, 1)]
+                while pending:
+                    node, coefficient = pending.pop()
+                    if not coefficient:
+                        continue
+                    if node in (False, True):
+                        continue
+                    if node.is_Integer:
+                        if binary and abs(int(node)) >= q:
+                            return False
+                        continue
+                    if self.logic and node.func is Not:
+                        pending.append((node.args[0], coefficient))
+                        continue
+                    additive = (
+                        node.func is Xor
+                        if self.logic
+                        else node.is_Add or (binary and node.func is EncodedXor)
+                    )
+                    if additive:
+                        pending.extend((term, coefficient) for term in node.args)
+                        continue
+                    if not self.logic and node.is_Mul:
+                        factors = []
+                        scale = coefficient
+                        for factor in node.args:
+                            if factor.is_Integer:
+                                value = abs(int(factor)) if binary else int(factor) % q
+                                if value >= q:
+                                    return False
+                                scale = multiply(scale, value)
+                            else:
+                                factors.append(factor)
+                        if len(factors) <= 1:
+                            if factors and scale:
+                                pending.append((factors[0], scale))
+                            continue
+                    previous = row.get(node, 0)
+                    value = previous ^ coefficient if binary else (previous + coefficient) % q
+                    if value:
+                        row[node] = value
+                    else:
+                        row.pop(node, None)
+                nonlinear = frozenset(
+                    symbol
+                    for node in row
+                    if node not in masks
+                    for symbol in node.free_symbols
+                    if symbol in masks
+                )
+                decomposition = (tuple(row.items()), nonlinear)
+                if len(cache) >= 8192:
+                    cache.clear()
+                cache[expression] = decomposition
+            rows.append(decomposition[0])
+            blocked.update(decomposition[1])
+        blocked = frozenset(blocked)
+        old = state["observations"]
+        common = 0
+        if state["blocked"] == blocked:
+            for previous, current in zip(old, observations):
+                if previous != current:
+                    break
+                common += 1
+        pivots = state["pivots"]
+        residuals = state["residuals"]
+        checkpoints = state["checkpoints"]
+        key = (blocked, observations[:2]) if observations and len(observations) <= 64 else None
+        if key != state["prefix_key"]:
+            prefixes = state["prefixes"]
+            if state["prefix_key"] is not None:
+                prefixes.pop(state["prefix_key"], None)
+                if len(prefixes) >= 16:
+                    prefixes.pop(next(iter(prefixes)))
+                prefixes[state["prefix_key"]] = (
+                    old, tuple(pivots), tuple(residuals), tuple(checkpoints),
+                )
+            previous = prefixes.get(key)
+            if previous is not None:
+                previous_observations, previous_pivots, previous_residuals, previous_checkpoints = previous
+                restored = 0
+                for previous_expression, expression in zip(previous_observations, observations):
+                    if previous_expression != expression:
+                        break
+                    restored += 1
+                if restored > common:
+                    pivot_count, residual_count = previous_checkpoints[restored]
+                    pivots[:] = previous_pivots[:pivot_count]
+                    residuals[:] = previous_residuals[:residual_count]
+                    checkpoints[:] = previous_checkpoints[:restored + 1]
+                    common = restored
+            state["prefix_key"] = key
+        pivot_count, residual_count = checkpoints[common]
+        del pivots[pivot_count:]
+        del residuals[residual_count:]
+        del checkpoints[common + 1:]
+        eligible = masks.keys() - blocked
+        inverses = state["inverses"]
+        for decomposition in rows[common:]:
+            row = dict(decomposition)
+            for pivot, basis in pivots:
+                coefficient = row.get(pivot, 0)
+                if not coefficient:
+                    continue
+                for term, value in basis.items():
+                    scaled = multiply(coefficient, value)
+                    previous = row.get(term, 0)
+                    value = previous ^ scaled if binary else (previous - scaled) % q
+                    if value:
+                        row[term] = value
+                    else:
+                        row.pop(term, None)
+            available = row.keys() & eligible
+            if available:
+                pivot = min(available, key=masks.__getitem__)
+                coefficient = row[pivot]
+                inverse = inverses.get(coefficient)
+                if inverse is None:
+                    inverse = int(field(coefficient) ** -1) if binary else pow(coefficient, -1, q)
+                    inverses[coefficient] = inverse
+                if inverse != 1:
+                    row = {term: multiply(inverse, value) for term, value in row.items()}
+                pivots.append((pivot, row))
+            elif row:
+                residuals.append(frozenset().union(*(term.free_symbols for term in row)))
+            checkpoints.append((len(pivots), len(residuals)))
+        state["observations"] = observations
+        state["blocked"] = blocked
+        support = set().union(*residuals) & self.shares_set
+        model = self.model_str
+        if model in ("probing_secret", "rps_secret"):
+            if support:
+                return False
+            self._prefix_witness = tuple(() for _ in range(self.len_secrets))
+            return True
+        if model == "pini":
+            needed = {self._share_locations[symbol][1] for symbol in support}
+            if len(needed - self.O_outIndex) > self.t_in:
+                return False
         budget = (
             self.probe_count
             if model == "ni"
-            else (
-                self.t_in
-                if model == "sni"
-                else self.shareNum - 1 if model in ("probing_share", "rps_share") else self.t
-            )
+            else self.t_in
+            if model == "sni"
+            else self.shareNum - 1
+            if model in ("probing_share", "rps_share")
+            else self.t
         )
         needed = [set() for _ in range(self.len_secrets)]
-        for value in self.P:
-            for symbol in value.free_symbols & self.shares_set:
-                family, index = self._share_locations[symbol]
-                needed[family].add(index)
-                if model != "rpe" and len(needed[family]) > budget:
-                    return False
-        if model == "rpe":
-            self.choice_rpe = tuple(
-                (i for (i, indices) in enumerate(needed) if len(indices) > budget)
-            )
-            return not self.choice_rpe
+        for symbol in support:
+            family, index = self._share_locations[symbol]
+            needed[family].add(index)
+            if model != "pini" and len(needed[family]) > budget:
+                return False
+        self._prefix_witness = tuple(tuple(sorted(indices)) for indices in needed)
         return True
+
+    def _prove_quadratic_masks(self, probes=None):
+        from sympy.logic.boolalg import And
+
+        self._prefix_witness = None
+        observations = tuple(self.P if probes is None else probes)
+        if not observations or len(observations) > 64:
+            return False
+        field = None if self.logic else self.GF_field
+        q = 2 if self.logic else int(field.order)
+        binary = self.logic or field.characteristic == 2
+        if not binary and field.degree != 1:
+            return False
+        masks = frozenset(symbols(mask) if isinstance(mask, str) else mask for mask in self.randoms)
+        masks -= self.shares_set
+        signature = (field, masks)
+        state = getattr(self, "_quadratic_proof_state", None)
+        if state is None or state["signature"] != signature:
+            state = {"signature": signature, "nodes": {}, "products": {}, "residuals": {}}
+            self._quadratic_proof_state = state
+        previous = state["residuals"].get(observations)
+        if previous is not None:
+            return self._prove_affine_prefix(previous)
+        cache = state["nodes"]
+        if len(cache) >= 8192:
+            cache.clear()
+        products = state["products"]
+
+        def multiply(left, right):
+            if not binary:
+                return left * right % q
+            if left <= 1 or right <= 1:
+                return left * right
+            key = (left, right) if left <= right else (right, left)
+            value = products.get(key)
+            if value is None:
+                value = int(field(left) * field(right))
+                if len(products) >= 4096:
+                    products.clear()
+                products[key] = value
+            return value
+
+        def accumulate(target, source, coefficient=1):
+            for monomial, value in source.items():
+                value = multiply(value, coefficient)
+                old = target.get(monomial, 0)
+                value = old ^ value if binary else (old + value) % q
+                if value:
+                    target[monomial] = value
+                else:
+                    target.pop(monomial, None)
+
+        def product(left, right):
+            result = {}
+            if len(left) * len(right) > 256:
+                return None
+            for first, first_value in left.items():
+                for second, second_value in right.items():
+                    factors = first + second
+                    if q == 2:
+                        factors = set(factors)
+                    if len(factors) > 2:
+                        return None
+                    monomial = tuple(sorted(factors, key=str))
+                    accumulate(result, {monomial: multiply(first_value, second_value)})
+                    if len(result) > 64:
+                        return None
+            return result
+
+        rows = []
+        for expression in observations:
+            pending = [(expression, False)]
+            while pending:
+                node, ready = pending.pop()
+                if node in cache:
+                    continue
+                if node in (False, True):
+                    cache[node] = {(): 1} if node == True else {}
+                    continue
+                if node.is_Integer:
+                    value = abs(int(node)) if binary else int(node) % q
+                    cache[node] = ({(): value} if value else {}) if value < q else None
+                    continue
+                if node.is_Symbol:
+                    cache[node] = {(node,): 1}
+                    continue
+                additive = node.func is Xor if self.logic else node.is_Add or (binary and node.func is EncodedXor)
+                multiplicative = node.func is And if self.logic else node.is_Mul
+                power = not self.logic and node.is_Pow and node.exp in (0, 1, 2)
+                if not (additive or multiplicative or power or (self.logic and node.func is Not)):
+                    cache[node] = None
+                    continue
+                children = (node.base,) if power else node.args
+                if not ready:
+                    pending.append((node, True))
+                    pending.extend((child, False) for child in children if child not in cache)
+                    continue
+                arguments = [cache[child] for child in children]
+                if any(argument is None for argument in arguments):
+                    cache[node] = None
+                    continue
+                if additive or node.func is Not:
+                    result = {(): 1} if node.func is Not else {}
+                    for argument in arguments:
+                        accumulate(result, argument)
+                else:
+                    result = {(): 1}
+                    for argument in arguments * int(node.exp) if power else arguments:
+                        result = product(result, argument)
+                        if result is None:
+                            break
+                cache[node] = result if result is None or len(result) <= 64 else None
+            row = cache.get(expression)
+            if row is None:
+                return False
+            rows.append(row)
+        if len(cache) >= 8192:
+            cache.clear()
+        if sum(map(len, rows)) > 256:
+            return False
+        used = set()
+        changed = False
+        score = (
+            len({symbol for row in rows for term in row for symbol in term} & self.shares_set),
+            sum(map(len, rows)),
+            sum(len(term) for row in rows for term in row),
+        )
+        for _ in range(min(len(masks), 8)):
+            candidates = {}
+            for row in rows:
+                for monomial, coefficient in row.items():
+                    if len(monomial) != 2 or monomial[0] == monomial[1]:
+                        continue
+                    for mask, anchor in (monomial, monomial[::-1]):
+                        if mask not in masks or mask in used:
+                            continue
+                        shift = {}
+                        for term, value in row.items():
+                            if anchor in term and term.count(anchor) == 1 and mask not in term:
+                                shift[tuple(symbol for symbol in term if symbol != anchor)] = value
+                        if not shift or not any(set(term) & self.shares_set for term in shift):
+                            continue
+                        inverse = int(field(coefficient) ** -1) if binary and coefficient != 1 else pow(coefficient, -1, q)
+                        scale = inverse if binary else (-inverse) % q
+                        shift = {term: multiply(value, scale) for term, value in shift.items()}
+                        key = (mask, tuple(sorted(shift.items(), key=str)))
+                        candidates[key] = shift
+                        if len(candidates) >= 32:
+                            break
+                    if len(candidates) >= 32:
+                        break
+                if len(candidates) >= 32:
+                    break
+            selected = None
+            for (mask, _), shift in candidates.items():
+                replacement = dict(shift)
+                replacement[(mask,)] = 1
+                updated = []
+                for row in rows:
+                    result = {}
+                    for term, coefficient in row.items():
+                        if mask not in term:
+                            accumulate(result, {term: coefficient})
+                            continue
+                        expansion = {(): coefficient}
+                        for symbol in term:
+                            expansion = product(expansion, replacement if symbol == mask else {(symbol,): 1})
+                            if expansion is None:
+                                break
+                        if expansion is None:
+                            result = None
+                            break
+                        accumulate(result, expansion)
+                    if result is None or len(result) > 64:
+                        break
+                    updated.append(result)
+                if len(updated) != len(rows) or sum(map(len, updated)) > 256:
+                    continue
+                candidate_score = (
+                    len({symbol for row in updated for term in row for symbol in term} & self.shares_set),
+                    sum(map(len, updated)),
+                    sum(len(term) for row in updated for term in row),
+                )
+                if candidate_score < score:
+                    score = candidate_score
+                    selected = mask, updated
+            if selected is None:
+                break
+            mask, rows = selected
+            used.add(mask)
+            changed = True
+        if not changed:
+            return False
+        residual = []
+        for row in rows:
+            terms = []
+            for monomial, coefficient in row.items():
+                if self.logic:
+                    term = And(*monomial) if monomial else True
+                else:
+                    factors = list(monomial)
+                    if coefficient != 1 or not factors:
+                        factors.insert(0, Integer(coefficient))
+                    term = factors[0] if len(factors) == 1 else Mul(*factors, evaluate=False)
+                terms.append(term)
+            residual.append(Xor(*terms) if self.logic else Add(*terms, evaluate=False) if terms else Integer(0))
+        residual = tuple(residual)
+        if len(state["residuals"]) >= 1024:
+            state["residuals"].clear()
+        state["residuals"][observations] = residual
+        return self._prove_affine_prefix(residual)
 
     def simplify(self, preserve_layout=False, componentwise_hw=False):
         if componentwise_hw:
@@ -748,10 +1696,15 @@ class Verifier:
                     )
                 )
 
+        original = tuple(self.P)
         compact_tuple()
-        if self.tech == 2:
-            costs = {}
-            source_costs = ({}, {})
+        if self.tech == 2 and not self._proof_only:
+            costs = self._static_cache["costs"]
+            source_costs = self._static_cache["sources"]
+            if len(costs) >= 8192:
+                costs.clear()
+                for cache in source_costs:
+                    cache.clear()
             best_probes = list(self.P)
             ignore_constants = componentwise_hw or (preserve_layout and self.HW)
             best_cost = self._residual_cost(best_probes, costs, source_costs, ignore_constants)
@@ -772,7 +1725,9 @@ class Verifier:
         else:
             remember = None
 
-        expression_text = {}
+        expression_text = self._static_cache["text"]
+        if len(expression_text) >= 8192:
+            expression_text.clear()
 
         def cached_text(expr):
             text = expression_text.get(expr)
@@ -782,7 +1737,32 @@ class Verifier:
             return text
 
         verify = self._static_boolean if self.logic else self._static_field
-        safe = verify(preserve_layout, componentwise_hw, remember, cached_text)
+        self._substitution_steps = []
+        try:
+            safe = verify(preserve_layout, componentwise_hw, remember, cached_text)
+            steps = tuple(self._substitution_steps)
+        finally:
+            self._substitution_steps = None
+        if steps and original:
+            plans = getattr(self, "_symbolic_prefix_plans", None)
+            if plans is None:
+                plans = self._symbolic_prefix_plans = {}
+            previous = plans.pop(original[0], None)
+            signature = (None if self.logic else self.GF_field, tuple(self.randoms), frozenset(self.shares_set))
+            if previous is not None and previous["signature"] == signature and previous["steps"] == steps:
+                state = previous
+            else:
+                evaluator = None
+                if not self.logic:
+                    evaluator = sympyGF2N() if self.GF_field.characteristic == 2 else sympyGFp()
+                    evaluator.set_field(self.GF_field)
+                state = {
+                    "first": original[0], "signature": signature,
+                    "steps": steps, "caches": [{} for _ in steps], "evaluator": evaluator,
+                }
+            if len(plans) >= 8:
+                plans.pop(next(iter(plans)))
+            plans[original[0]] = self._symbolic_prefix_state = state
         compact_tuple()
         if not safe:
             if remember is not None:
@@ -793,7 +1773,12 @@ class Verifier:
 
     def _static_boolean(self, preserve_layout, componentwise_hw, remember, cached_text):
         slot_zero = sympify(False)
-        normalized = {}
+        normalized = self._static_cache["normalized"]
+        if len(normalized) >= 8192:
+            normalized.clear()
+        count_cache = self._static_cache["counts"]
+        if len(count_cache) >= 8192:
+            count_cache.clear()
         self.P = P = [self._normalize_boolean(expr, normalized) for expr in self.P]
         test = self._test_security
         observation_counts = None
@@ -813,13 +1798,13 @@ class Verifier:
                 mask_counts = dict.fromkeys(mask_names, 0)
                 observation_counts = []
                 for expr in P:
-                    s = cached_text(expr)
-                    row = {}
-                    for r, scan in mask_scans:
-                        count = len(scan(s))
-                        if count:
-                            row[r] = count
-                            mask_counts[r] += count
+                    row = count_cache.get(expr)
+                    if row is None:
+                        s = cached_text(expr)
+                        row = {r: count for r, scan in mask_scans if (count := len(scan(s)))}
+                        count_cache[expr] = row
+                    for r, count in row.items():
+                        mask_counts[r] += count
                     observation_counts.append(row)
             deleted = False
             for r in mask_names if not preserve_layout or componentwise_hw else ():
@@ -960,6 +1945,8 @@ class Verifier:
                         terms.add(term)
                 replacement = Xor(*terms, phase)
                 sub = {atom: replacement, anchor: atom}
+                if self._substitution_steps is not None and len(self._substitution_steps) < 8:
+                    self._substitution_steps.append(sub.copy())
                 updates = {
                     i: self._normalize_boolean(P[i].xreplace(sub), normalized) for i in affected
                 }
@@ -977,13 +1964,13 @@ class Verifier:
                     mask_counts[rr] -= count
                 new_row = None
                 if new_expr is not None:
-                    s = cached_text(new_expr)
-                    new_row = {}
-                    for rr, scan in mask_scans:
-                        count = len(scan(s))
-                        if count:
-                            new_row[rr] = count
-                            mask_counts[rr] += count
+                    new_row = count_cache.get(new_expr)
+                    if new_row is None:
+                        s = cached_text(new_expr)
+                        new_row = {r: count for r, scan in mask_scans if (count := len(scan(s)))}
+                        count_cache[new_expr] = new_row
+                    for rr, count in new_row.items():
+                        mask_counts[rr] += count
                 else:
                     deleted = True
                 P[i] = new_expr
@@ -995,6 +1982,9 @@ class Verifier:
 
     def _static_field(self, preserve_layout, componentwise_hw, remember, cached_text):
         slot_zero = Integer(0)
+        count_cache = self._static_cache["counts"]
+        if len(count_cache) >= 8192:
+            count_cache.clear()
         P = self.P
         test = self._test_security
         if test():
@@ -1219,13 +2209,13 @@ class Verifier:
                         mask_counts[r] -= count
                 new_row = None
                 if new_expr is not None:
-                    text = cached_text(new_expr)
-                    new_row = {}
-                    for r, scan in mask_scans:
-                        count = len(scan(text))
-                        if count:
-                            new_row[r] = count
-                            mask_counts[r] += count
+                    new_row = count_cache.get(new_expr)
+                    if new_row is None:
+                        text = cached_text(new_expr)
+                        new_row = {r: count for r, scan in mask_scans if (count := len(scan(text)))}
+                        count_cache[new_expr] = new_row
+                    for r, count in new_row.items():
+                        mask_counts[r] += count
                 else:
                     deleted = True
                 P[i], observation_counts[i] = (new_expr, new_row)
@@ -1418,6 +2408,8 @@ class Verifier:
                         )
                 replacement = Add(*terms, evaluate=False)
                 sub = {atom: replacement, anchor: atom}
+                if self._substitution_steps is not None and len(self._substitution_steps) < 8:
+                    self._substitution_steps.append(sub.copy())
                 updates = {i: P[i] for i in affected}
                 used_masks.add(r)
                 break
@@ -1588,10 +2580,9 @@ class Verifier:
         self.P = list(original_probes)
         self.P_channel_count = None
         self.P_xor_groups = ()
-        self.P_raw = list(original_probes)
         self.choice_rpe = tuple()
-        self.rpe_input_indices = tuple((() for _ in range(self.len_secrets)))
-        channel_key = tuple(sorted(map(str, set(self.P))))
+        self.rpe_input_indices = self._empty_rpe_indices
+        channel_key = frozenset(self.P)
         cache = ("random", self.model_str, self.t, self.tech, channel_key)
         evaluated = self._evaluate_probes(cache)
         mi, exact_zero = (evaluated["mi"], evaluated["exact_zero"])
@@ -1606,7 +2597,7 @@ class Verifier:
             "unknown": exact_zero is None,
             "exact_zero": exact_zero,
             "failed": failed,
-            "leakage": list(original_probes) if failed else [],
+            "leakage": original_probes if failed else [],
         }
 
     def _check_random_observation(self, item, start_time):
@@ -1679,24 +2670,29 @@ class Verifier:
     def _aggregate_random_result(self, result):
         order = result["Ci"]
         stats = self.rp_statistics
+        weight = result.get("batch_count", 1)
 
         def record(counts, lower, upper):
-            counts["lower"][order] += int(lower)
-            counts["upper"][order] += int(upper) - 1
+            counts["lower"][order] += weight * int(lower)
+            counts["upper"][order] += weight * (int(upper) - 1)
 
         checks = result["requests"]
-        stats["processed_by_order"][order] += 1
+        stats["processed_by_order"][order] += weight
         record(
             stats,
             any((check["failed"] and (not check["unknown"]) for check in checks)),
             any((check["failed"] for check in checks)),
         )
         for index, check in enumerate(checks):
-            self.observation_cache[check["cache"]] = check["mi"]
-            self.exact_zero_cache[check["cache"]] = check["exact_zero"]
-            self.mi_text_cache[check["cache"]] = check.get("mi_text")
-            self.choice_rpe_cache[check["cache"]] = check["choice_rpe"]
-            self.rpe_witness_cache[check["cache"]] = check["rpe_input_indices"]
+            if self.mcore > 0 and "batch_count" not in result:
+                cache = check["cache"]
+                self.observation_cache[cache] = check["mi"]
+                self.exact_zero_cache[cache] = check["exact_zero"]
+                if check.get("mi_text") is not None:
+                    self.mi_text_cache[cache] = check["mi_text"]
+                if self.model_str == "rpe":
+                    self.choice_rpe_cache[cache] = check["choice_rpe"]
+                    self.rpe_witness_cache[cache] = check["rpe_input_indices"]
             if check["failed"]:
                 self.leakage.extend(check["leakage"])
                 self.gadget.row_verdict[order, result["row"], index] = (
@@ -1725,7 +2721,7 @@ class Verifier:
                     occurs = any(
                         (set(event).issubset(check["choice_rpe"]) for check in selected)
                     )
-                    counts[order] += int(occurs) - 1
+                    counts[order] += weight * (int(occurs) - 1)
 
     def _random_result(self):
         size = len(self.gadget.observationsIn)
@@ -1777,8 +2773,14 @@ class Verifier:
                     if selected:
                         counts[:] = list(map(max, zip(*selected)))
 
+        bounds_cache = {}
+
         def summarize(counts, degree=1):
-            bound = self.probability_bounds(counts["upper"], counts["lower"], k=degree)
+            key = (tuple(counts["upper"]), tuple(counts["lower"]), degree)
+            bound = bounds_cache.get(key)
+            if bound is None:
+                bound = self.probability_bounds(key[0], key[1], k=degree)
+                bounds_cache[key] = bound
             counts["bounds"] = {
                 key: str(bound[key]) for key in ("lower", "upper", "union_upper")
             }

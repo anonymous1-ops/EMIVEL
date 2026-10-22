@@ -25,12 +25,18 @@ class MIA:
         self.freeSymbolsInp = set()
         self.mayLeak = set()
         self.condition = set()
-        self._rpe_affine_cache = {}
+        self._affine_cache = {}
+        self._evaluation_cache = {}
+        self._reuse_evaluation = False
+        self._conditioning_cache = None
 
     def initialize(self):
         self.last_exact_zero = True
         self.last_mi_text = None
-        self._rpe_affine_cache = {}
+        self._affine_cache = {}
+        self._evaluation_cache = {}
+        self._reuse_evaluation = False
+        self._conditioning_cache = None
         self.Bits = self.gadget.bits
         self.Arithmetic = {
             "field": 2 if self.gadget.logic else self.gadget.field,
@@ -97,7 +103,15 @@ class MIA:
     def compute(self):
         self.last_exact_zero = True
         self.last_mi_text = None
-        value = self.model()
+        self._evaluation_cache = {}
+        self._reuse_evaluation = False
+        self._conditioning_cache = {}
+        try:
+            value = self.model()
+        finally:
+            self._evaluation_cache = {}
+            self._reuse_evaluation = False
+            self._conditioning_cache = None
         if isinstance(value, Decimal):
             self.last_mi_text = str(value)
         return float(value)
@@ -170,6 +184,7 @@ class MIA:
                 )
             choices.append(selections)
 
+        self._reuse_evaluation = prod(map(len, choices)) > 1
         best_mi = None
         for selected in product(*choices):
             self.condition = set(flatten(selected))
@@ -218,6 +233,7 @@ class MIA:
             self.condition = []
             return self.conditional_mi()
 
+        self._reuse_evaluation = len(conditions) > 1
         best_mi = None
         for nL in conditions:
 
@@ -252,11 +268,12 @@ class MIA:
             index = self.funcMapping_index[self.shares[share]]
             families[family].setdefault(index, set()).add(share)
 
-        affine = self._rpe_affine_space()
+        self._reuse_evaluation = True
+        affine = self._affine_space()
         conditional_mi = (
-            self.conditional_mi if affine is None else lambda: self._affine_rpe_cmi(affine)
+            self.conditional_mi if affine is None else lambda: self._affine_cmi(affine)
         )
-        if affine is not None:
+        if affine is not None and self.Arithmetic["logic"]:
             _, bits, needed = affine
             required = [set() for _ in range(self.len_secrets)]
             for share in sharesInp:
@@ -326,80 +343,238 @@ class MIA:
                 row ^= basis[pivot]
         return len(basis)
 
-    def _rpe_affine_space(self):
-
-        if not self.Arithmetic["logic"] or (
-            self.HW and "hw_vector" not in self.gadget.checkOptions["robust"]
-        ):
+    def _affine_space(self):
+        q = int(self.Arithmetic["field"])
+        if self.HW and (q != 2 or "hw_vector" not in self.gadget.checkOptions["robust"]):
             return None
+        observations = tuple(self.probes)
+        prepared = self._conditioning_cache if self._reuse_evaluation else None
+        if prepared is not None:
+            request = (
+                self.Arithmetic["GF_field"], self.Arithmetic["logic"], self.HW,
+                "hw_vector" in self.gadget.checkOptions["robust"], observations,
+                frozenset(self.mayLeak) | frozenset(self.condition),
+            )
+            if prepared.get("affine_request") == request:
+                return prepared["affine_space"]
+            prepared["affine_request"], prepared["affine_space"] = request, None
         randoms = set(self.randoms)
-        if randoms & self.shares_set or self.freeSymbolsInp - self.shares_set - randoms:
+        free_symbols = set().union(*(probe.free_symbols for probe in observations))
+        if (free_symbols | set(self.mayLeak) | set(self.condition)) - self.shares_set - randoms:
             return None
-        inputs = tuple(self.shares)
-        sources = inputs + tuple(sorted(randoms, key=str))
-        signature = sources
-        cache = getattr(self, "_rpe_affine_cache", {})
-        if cache.get("sources") != signature:
+        inputs = tuple(sorted(self.shares_set, key=str))
+        sources = inputs + tuple(sorted(randoms - self.shares_set, key=str))
+        field = self.Arithmetic["GF_field"]
+        if field.characteristic != 2 and field.degree != 1:
+            return None
+        signature = (field, sources, self.Arithmetic["logic"])
+        cache = self._affine_cache
+        if cache.get("signature") != signature:
             cache = {
-                "sources": signature,
+                "signature": signature,
                 "bits": {symbol: 1 << i for i, symbol in enumerate(sources)},
-                "rows": {},
+                "positions": {symbol: i for i, symbol in enumerate(sources)},
+                "nodes": {}, "products": {}, "inverses": {1: 1},
             }
-            self._rpe_affine_cache = cache
-        bits, rows_cache = cache["bits"], cache["rows"]
+            self._affine_cache = cache
+        if cache.get("observations") == observations:
+            if prepared is not None:
+                prepared["affine_space"] = cache["space"]
+            return cache["space"]
+        cache["observations"], cache["space"], cache["ranks"] = observations, None, {}
+        nodes = cache["nodes"]
+        if len(nodes) >= 8192:
+            nodes.clear()
+        binary = field.characteristic == 2
+        extension = binary and field.degree > 1
+        logic = self.Arithmetic["logic"]
 
-        def parse(expr):
-            if expr in rows_cache:
-                return rows_cache[expr]
-            if isinstance(expr, Symbol):
-                value = bits.get(expr)
-            elif expr in (False, True, 0, 1):
-                value = 0
-            elif expr.func is Not:
-                value = parse(expr.args[0])
-            elif expr.func is Xor:
-                value = 0
-                for argument in expr.args:
-                    part = parse(argument)
-                    if part is None:
-                        value = None
-                        break
-                    value ^= part
-            else:
-                value = None
-            rows_cache[expr] = value
+        def multiply(left, right):
+            if not extension:
+                return left * right % q
+            if left <= 1 or right <= 1:
+                return left * right
+            key = (min(left, right), max(left, right))
+            value = cache["products"].get(key)
+            if value is None:
+                value = int(field(left) * field(right))
+                if len(cache["products"]) >= 4096:
+                    cache["products"].clear()
+                cache["products"][key] = value
             return value
 
-        rows = tuple(parse(probe) for probe in self.probes)
-        if any(row is None for row in rows):
-            return None
-
-        basis, needed = {}, 0
-        for row in rows:
-            while row >> len(inputs):
-                pivot = row.bit_length() - 1
-                if pivot not in basis:
-                    basis[pivot] = row
-                    break
-                row ^= basis[pivot]
+        rows = []
+        for expression in observations:
+            pending = [(expression, False)]
+            while pending:
+                node, ready = pending.pop()
+                if node in nodes:
+                    continue
+                if isinstance(node, Symbol):
+                    nodes[node] = ({cache["positions"][node]: 1}, 0)
+                    continue
+                if node in (True, False):
+                    nodes[node] = ({}, int(node == True))
+                    continue
+                if node.is_Rational:
+                    numerator, denominator = map(int, node.as_numer_denom())
+                    if extension:
+                        numerator = abs(numerator)
+                        if not 0 <= numerator < q or not 0 < denominator < q:
+                            return None
+                    else:
+                        numerator, denominator = numerator % q, denominator % q
+                    if denominator == 0:
+                        return None
+                    nodes[node] = ({}, int(field(numerator) / field(denominator)))
+                    continue
+                additive = node.func is Xor if logic else node.is_Add or (binary and node.func is EncodedXor)
+                multiplicative = not logic and node.is_Mul
+                power = not logic and node.is_Pow and node.exp.is_Integer and int(node.exp) >= 0
+                negate = logic and node.func is Not
+                if not (additive or multiplicative or power or negate):
+                    nodes[node] = None
+                    continue
+                children = (node.base,) if power else node.args
+                if not ready:
+                    pending.append((node, True))
+                    pending.extend((child, False) for child in children if child not in nodes)
+                    continue
+                parts = [nodes[child] for child in children]
+                if any(part is None for part in parts):
+                    nodes[node] = None
+                    continue
+                if additive or negate:
+                    row, constant = {}, int(negate)
+                    for part, scalar in parts:
+                        constant = constant ^ scalar if binary else (constant + scalar) % q
+                        for position, coefficient in part.items():
+                            previous = row.get(position, 0)
+                            value = previous ^ coefficient if binary else (previous + coefficient) % q
+                            if value:
+                                row[position] = value
+                            else:
+                                row.pop(position, None)
+                    nodes[node] = (row, constant)
+                elif power:
+                    row, constant = parts[0]
+                    exponent = int(node.exp)
+                    if exponent == 0:
+                        nodes[node] = ({}, 1)
+                    elif not row:
+                        nodes[node] = ({}, int(field(constant) ** (1 + (exponent - 1) % (q - 1))))
+                    elif (exponent - 1) % (q - 1) == 0:
+                        nodes[node] = (row, constant)
+                    else:
+                        nodes[node] = None
+                else:
+                    nonconstant = [part for part in parts if part[0]]
+                    if len(nonconstant) > 1:
+                        nodes[node] = None
+                        continue
+                    scale = 1
+                    for row, constant in parts:
+                        if not row:
+                            scale = multiply(scale, constant)
+                    row, constant = nonconstant[0] if nonconstant else ({}, 1)
+                    nodes[node] = (
+                        {position: value for position, coefficient in row.items() if (value := multiply(scale, coefficient))},
+                        multiply(scale, constant),
+                    )
+            parsed = nodes[expression]
+            if parsed is None:
+                return None
+            row = parsed[0]
+            if q == 2:
+                rows.append(sum(1 << position for position in row))
             else:
-                needed |= row
-        return rows, bits, needed
+                rows.append(tuple(row.items()))
+        rows = tuple(rows)
+        _, needed = self._affine_rank(rows, cutoff=len(inputs))
+        cache["space"] = (rows, cache["bits"], needed)
+        if prepared is not None:
+            prepared["affine_space"] = cache["space"]
+        return cache["space"]
 
-    def _affine_rpe_cmi(self, space):
+    def _affine_rank(self, rows, removed=0, cutoff=0):
+        q = int(self.Arithmetic["field"])
+        basis, needed = {}, 0
+        if q == 2:
+            if not cutoff:
+                return self._gf2_rank(row & ~removed for row in rows), 0
+            for value in rows:
+                row = value & ~removed
+                while row >> cutoff:
+                    pivot = row.bit_length() - 1
+                    if pivot not in basis:
+                        basis[pivot] = row
+                        break
+                    row ^= basis[pivot]
+                else:
+                    needed |= row
+            return len(basis), needed
+        field = self.Arithmetic["GF_field"]
+        extension = field.characteristic == 2 and field.degree > 1
+        cache = self._affine_cache
+
+        def multiply(left, right):
+            if not extension:
+                return left * right % q
+            if left <= 1 or right <= 1:
+                return left * right
+            key = (min(left, right), max(left, right))
+            value = cache["products"].get(key)
+            if value is None:
+                value = int(field(left) * field(right))
+                if len(cache["products"]) >= 4096:
+                    cache["products"].clear()
+                cache["products"][key] = value
+            return value
+
+        for values in rows:
+            row = {position: value for position, value in values if not (1 << position) & removed}
+            while row and max(row) >= cutoff:
+                pivot = max(row)
+                coefficient = row[pivot]
+                if pivot not in basis:
+                    inverse = cache["inverses"].get(coefficient)
+                    if inverse is None:
+                        inverse = int(field(coefficient) ** -1)
+                        if len(cache["inverses"]) >= 4096:
+                            cache["inverses"].clear()
+                        cache["inverses"][coefficient] = inverse
+                    basis[pivot] = {position: multiply(value, inverse) for position, value in row.items()}
+                    break
+                for position, value in basis[pivot].items():
+                    scaled = multiply(coefficient, value)
+                    previous = row.get(position, 0)
+                    updated = previous ^ scaled if extension else (previous - scaled) % q
+                    if updated:
+                        row[position] = updated
+                    else:
+                        row.pop(position, None)
+            else:
+                for position in row:
+                    needed |= 1 << position
+        return len(basis), needed
+
+    def _affine_cmi(self, space):
         rows, bits, _ = space
         conditioned = 0
         for symbol in self.condition:
-            conditioned |= bits[symbol]
+            conditioned |= bits.get(symbol, 0)
         remaining = conditioned
         for symbol in self.mayLeak:
-            remaining |= bits[symbol]
-
-        value = self._gf2_rank(row & ~conditioned for row in rows) - self._gf2_rank(
-            row & ~remaining for row in rows
-        )
+            remaining |= bits.get(symbol, 0)
+        ranks = self._affine_cache["ranks"]
+        if len(ranks) >= 4096:
+            ranks.clear()
+        for removed in (conditioned, remaining):
+            if removed not in ranks:
+                ranks[removed] = self._affine_rank(rows, removed)[0]
+        value = ranks[conditioned] - ranks[remaining]
         self.last_exact_zero = value == 0
-        return value / self.MI_norm
+        return value * log2(self.Arithmetic["field"]) / self.MI_norm
 
     def reduce_observations(self, x, y, z):
 
@@ -452,9 +627,135 @@ class MIA:
 
     def conditional_mi(self, batch_bits=None):
         self.last_exact_zero = True
-        if self.Arithmetic["logic"]:
-            return self._boolean_cmi(batch_bits=batch_bits)
-        return self._field_cmi(batch_bits=batch_bits)
+        if batch_bits is not None and (not isinstance(batch_bits, int) or batch_bits < 0):
+            raise ValueError("batch_bits must be a nonnegative integer")
+        affine = self._affine_space()
+        if affine is not None:
+            return self._affine_cmi(affine)
+        cache = self._conditioning_cache
+        if cache is not None and self._reuse_evaluation:
+            x, z = tuple(self.mayLeak), tuple(self.condition)
+            targets = frozenset(x) | frozenset(z)
+            if len(targets) == len(x) + len(z) and targets <= self.shares_set:
+                request = (
+                    self.Arithmetic["GF_field"], self.Arithmetic["logic"], self.HW,
+                    "hw_vector" in self.gadget.checkOptions["robust"], tuple(self.probes),
+                    self._channel_probe_count()
+                    if self.HW and (
+                        not self.Arithmetic["logic"] or "hw_vector" not in self.gadget.checkOptions["robust"]
+                    ) else None,
+                    targets,
+                )
+                joint = cache.get("joint")
+                if joint is not None and joint[0] == request:
+                    _, counts_xyz, original_x, original_z, field, packed_width, entropy_xyz = joint
+                    if packed_width:
+                        width_y = packed_width - len(original_x) - len(original_z)
+                        positions = dict(zip(original_x, range(len(original_x))))
+                        positions.update(zip(original_z, range(packed_width - len(original_z), packed_width)))
+                        selected = tuple(positions[symbol] for symbol in z)
+                        mask = (1 << width_y) - 1
+
+                        def project(key):
+                            value = (
+                                sum(int(chunk) << (64 * i) for i, chunk in enumerate(key))
+                                if isinstance(key, tuple) else int(key)
+                            )
+                            result = (value >> len(original_x)) & mask
+                            for output, position in enumerate(selected, width_y):
+                                result |= ((value >> position) & 1) << output
+                            return result
+
+                    else:
+                        width = len(next(iter(counts_xyz)))
+                        end_y = width - len(original_z)
+                        positions = dict(zip(original_x, range(len(original_x))))
+                        positions.update(zip(original_z, range(end_y, width)))
+                        selected = tuple(positions[symbol] for symbol in z)
+
+                        def project(key):
+                            return key[len(original_x) : end_y] + tuple(key[position] for position in selected)
+
+                    counts_yz = Counter()
+                    for key, count in counts_xyz.items():
+                        counts_yz[project(key)] += count
+                    probabilities = np.fromiter(counts_yz.values(), dtype=float) / sum(counts_xyz.values())
+                    entropy_yz = -np.sum(probabilities * np.log2(probabilities))
+                    mi = len(targets) * log2(field) + entropy_yz - entropy_xyz - len(z) * log2(field)
+                    return self._finish_cmi(counts_xyz, counts_yz, x, z, mi, field, projection=project)
+                cache["pending_joint"] = request
+        try:
+            if self.Arithmetic["logic"]:
+                return self._boolean_cmi(batch_bits=batch_bits)
+            return self._field_cmi(batch_bits=batch_bits)
+        finally:
+            if cache is not None:
+                cache.pop("pending_joint", None)
+
+    def _evaluate_columns(self, expressions, sources, radices, offsets, total_states, batch_size):
+        logic = self.Arithmetic["logic"]
+        field = self.Arithmetic["GF_field"]
+        signature = (field, logic, sources, tuple(radices), tuple(offsets))
+        cache = self._evaluation_cache if self._reuse_evaluation else {}
+        if cache.get("signature") != signature:
+            cache = {"signature": signature, "functions": {}, "columns": {}}
+            if self._reuse_evaluation:
+                self._evaluation_cache = cache
+        functions = cache["functions"]
+        missing = tuple(dict.fromkeys(expression for expression in expressions if expression not in functions))
+        if logic:
+            positions = {symbol: index for index, symbol in enumerate(sources)}
+            for expression in missing:
+                replacements = {
+                    str(symbol): f"v[:,{positions[symbol]}]" for symbol in expression.free_symbols
+                }
+                code = str(expression)
+                if replacements:
+                    pattern = r"\b(?:" + "|".join(map(re.escape, replacements)) + r")\b"
+                    code = re.sub(pattern, lambda match: replacements[match.group()], code)
+                functions[expression] = eval(
+                    "lambda v: np.broadcast_to("
+                    f"np.asarray(({code}), dtype=np.uint8) & 1, (v.shape[0],))"
+                )
+        elif missing:
+            functions.update(zip(missing, self._compile_field_expressions(missing, sources, field)))
+        columns = cache["columns"]
+        width = len(set(columns).union(expressions)) + len(sources)
+        retained = (
+            self._reuse_evaluation and total_states <= (1 << 18)
+            and total_states * max(1, width) * (1 if logic else 8) <= (8 << 20)
+        )
+        if retained and "values" not in cache:
+            indices = np.arange(total_states, dtype=np.uint64)
+            values = np.empty((total_states, len(sources)), dtype=np.uint8 if logic else np.int64)
+            for column, (radix, offset) in enumerate(zip(radices, offsets)):
+                values[:, column] = indices % radix + offset
+                indices //= radix
+            cache["values"] = values if logic else field(values)
+        if retained:
+            values = cache["values"]
+            for expression in expressions:
+                if expression not in columns:
+                    columns[expression] = np.asarray(functions[expression](values), dtype=np.uint8 if logic else np.int64)
+            for start in range(0, total_states, batch_size):
+                end = min(start + batch_size, total_states)
+                yield np.column_stack([columns[expression][start:end] for expression in expressions])
+            return
+        cache.pop("values", None)
+        columns.clear()
+        for start in range(0, total_states, batch_size):
+            end = min(start + batch_size, total_states)
+            indices = np.arange(start, end, dtype=np.uint64)
+            values = np.empty((end - start, len(sources)), dtype=np.uint8 if logic else np.int64)
+            for column, (radix, offset) in enumerate(zip(radices, offsets)):
+                values[:, column] = indices % radix + offset
+                indices //= radix
+            if not logic:
+                values = field(values)
+            yield np.column_stack([
+                np.asarray(functions[expression](values), dtype=np.uint8 if logic else np.int64)
+                for expression in expressions
+            ])
 
     def _boolean_cmi(self, batch_bits=None, hw=None):
         hw = self.HW if hw is None else hw
@@ -484,29 +785,10 @@ class MIA:
         if not isinstance(batch_bits, int) or batch_bits < 0:
             raise ValueError("batch_bits must be a nonnegative integer")
 
-        symbol_positions = {symbol: index for index, symbol in enumerate(sources)}
         public = set(sources) - self.shares_set - set(self.randoms)
         radices = [1 if symbol in public else 2 for symbol in sources]
         offsets = [int(symbol in public) for symbol in sources]
         total_states = self._state_count(radices)
-
-        compiled = []
-        for expression in xyz:
-            replacements = {
-                str(symbol): f"v[:,{symbol_positions[symbol]}]"
-                for symbol in expression.free_symbols
-                if symbol in symbol_positions
-            }
-            code = str(expression)
-            if replacements:
-                pattern = r"\b(?:" + "|".join(map(re.escape, replacements)) + r")\b"
-                code = re.sub(pattern, lambda match: replacements[match.group()], code)
-            compiled.append(
-                eval(
-                    "lambda v: np.broadcast_to("
-                    f"np.asarray(({code}), dtype=np.uint8) & 1, (v.shape[0],))"
-                )
-            )
 
         channel_count = self._channel_probe_count() if summed_hw else 0
         hw_bits = max(1, channel_count.bit_length()) if summed_hw else 0
@@ -546,14 +828,7 @@ class MIA:
 
         counts_xyz, counts_yz = Counter(), Counter()
         batch_size = 1 << batch_bits
-        for start in range(0, total_states, batch_size):
-            end = min(start + batch_size, total_states)
-            indices = np.arange(start, end, dtype=np.uint64)
-            values = np.empty((end - start, source_count), dtype=np.uint8)
-            for column, (radix, offset) in enumerate(zip(radices, offsets)):
-                values[:, column] = indices % radix + offset
-                indices //= radix
-            observations = np.column_stack([function(values) for function in compiled])
+        for observations in self._evaluate_columns(xyz, sources, radices, offsets, total_states, batch_size):
             if summed_hw:
                 observations = np.concatenate(
                     [
@@ -567,14 +842,17 @@ class MIA:
                 )
             counts_xyz.update(pack(observations, weights[0], lenx))
             counts_yz.update(pack(observations[:, lenx:], weights[1], 0))
-            del indices, values, observations
+            del observations
 
         p_xyz = np.array(list(counts_xyz.values()), dtype=float) / total_states
         p_yz = np.array(list(counts_yz.values()), dtype=float) / total_states
         entropy_xyz = -np.sum(p_xyz * np.log2(p_xyz))
         entropy_yz = -np.sum(p_yz * np.log2(p_yz))
         mi = entropy_xz + entropy_yz - entropy_xyz - lenz
-        return self._finish_cmi(counts_xyz, counts_yz, x, z, mi, 2, packed=True)
+        return self._finish_cmi(
+            counts_xyz, counts_yz, x, z, mi, 2, packed=True,
+            joint_entropy=entropy_xyz, packed_width=packed_width,
+        )
 
     def _field_cmi(self, batch_bits=None, hw=None):
         hw = self.HW if hw is None else hw
@@ -585,7 +863,6 @@ class MIA:
             return 0.0
 
         field = self.Arithmetic["field"]
-        field_type = self.Arithmetic["GF_field"]
         y, x, z = list(self.probes), list(self.mayLeak), list(self.condition)
         if not hw:
             y = self.reduce_observations(x, y, z)
@@ -618,25 +895,14 @@ class MIA:
         offsets = [int(symbol in public) for symbol in sources]
         radices = [field - offset for offset in offsets]
         total_states = self._state_count(radices)
-        compiled = self._compile_field_expressions(xyz, sources, field_type)
         if hw:
             channel_count = self._channel_probe_count()
             vector_hw = "hw_vector" in self.gadget.checkOptions["robust"]
             byte_hw = np.array([value.bit_count() for value in range(256)], dtype=np.uint8)
 
-        counts_xyz, counts_yz = Counter(), Counter()
+        counts_xyz = Counter()
         batch_size = 1 << batch_bits
-        for start in range(0, total_states, batch_size):
-            end = min(start + batch_size, total_states)
-            indices = np.arange(start, end, dtype=np.uint64)
-            values = np.empty((end - start, source_count), dtype=int)
-            for column, (radix, offset) in enumerate(zip(radices, offsets)):
-                values[:, column] = indices % radix + offset
-                indices //= radix
-            values = field_type(values)
-            observations = np.column_stack(
-                [np.asarray(function(values), dtype=np.int64) for function in compiled]
-            )
+        for observations in self._evaluate_columns(xyz, sources, radices, offsets, total_states, batch_size):
             if hw:
                 encoded = np.ascontiguousarray(
                     observations[:, lenx : lenx + channel_count], dtype=np.uint64
@@ -655,18 +921,18 @@ class MIA:
                 )
                 del encoded, bytes_view, channel_hw
             counts_xyz.update([tuple(int(value) for value in row) for row in observations])
-            counts_yz.update(
-                [tuple(int(value) for value in row) for row in observations[:, lenx:]]
-            )
-            del indices, values, observations
+            del observations
 
+        counts_yz = Counter()
+        for key, count in counts_xyz.items():
+            counts_yz[key[lenx:]] += count
         total = sum(counts_xyz.values())
         p_xyz = np.array(list(counts_xyz.values()), dtype=float) / total
         p_yz = np.array(list(counts_yz.values()), dtype=float) / total
         entropy_xyz = -np.sum(p_xyz * np.log2(p_xyz))
         entropy_yz = -np.sum(p_yz * np.log2(p_yz))
         mi = entropy_xz + entropy_yz - entropy_xyz - entropy_z
-        return self._finish_cmi(counts_xyz, counts_yz, x, z, mi, field)
+        return self._finish_cmi(counts_xyz, counts_yz, x, z, mi, field, joint_entropy=entropy_xyz)
 
     @staticmethod
     def _compile_field_expressions(exprs, vars_list, GF_field):
@@ -791,10 +1057,23 @@ class MIA:
             raise ValueError(f"Too many states for exact MI enumeration: {count}")
         return count
 
-    def _finish_cmi(self, counts_xyz, counts_yz, x, z, numerical_mi, field, packed=False):
+    def _finish_cmi(
+        self, counts_xyz, counts_yz, x, z, numerical_mi, field, packed=False,
+        projection=None, joint_entropy=None, packed_width=0,
+    ):
 
         multiplicity = int(field) ** len(set(x) - set(z))
-        if not packed:
+        cache = self._conditioning_cache
+        if cache is not None and "pending_joint" in cache and joint_entropy is not None:
+            width = max(1, (packed_width + 63) // 64) if packed else len(next(iter(counts_xyz), ()))
+            if 4096 + len(counts_xyz) * (192 + 48 * width) <= (8 << 20):
+                cache["joint"] = (
+                    cache["pending_joint"], counts_xyz, tuple(x), tuple(z), field,
+                    packed_width if packed else 0, joint_entropy,
+                )
+        if projection is not None:
+            project = projection
+        elif not packed:
             project = lambda key: key[len(x) :]
         elif isinstance(next(iter(counts_yz), 0), tuple):
             chunks = len(next(iter(counts_yz)))

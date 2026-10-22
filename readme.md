@@ -15,11 +15,9 @@ EMIVEL checks the functional correctness and security of masked gadgets and circ
 | Mask failures and reuse | Assign a mask to `0` to model a failure; reuse the same random variable to model reused randomness. |
 | Execution | Serial or process parallel verification, lazy observation enumeration, live observation reporting, saved results, runtime and peak memory. |
 
-`probing_secret` and `rps_secret` test secret leakage (MI). `probing_share` and `rps_share` test share simulation (CMI), using at most n-1 input shares per input family. NI/SNI/PINI/RPC/RPE use their corresponding share-simulation conditions. The old CLI names `probing` and `rps` are replaced by the explicit `_secret` names.
+`probing_secret` and `rps_secret` test secret leakage (MI). `probing_share` and `rps_share` test share simulation (CMI), using at most n-1 input shares per input family. NI/SNI/PINI/RPC/RPE use their corresponding share-simulation conditions.
 
 Random probing supports **Standard observations only**, without transition, glitch, or HW extensions. It reports failure coefficients and bounds on f(p), together with log2 threshold bounds. Orders above `-c` remain bounded rather than exactly counted.
-
-The numerical backend decides zero MI/CMI using exact integer counts; nonzero values use finite-precision logarithms. `probing_secret` divides MI by total secret entropy; NI/SNI/PINI/`probing_share` divide CMI by total input-share entropy. Random-model values are in bits. Static-only failures remain unresolved.
 
 ## Installation
 
@@ -70,7 +68,7 @@ python EMIVEL.py -p test/ISW_2share.txt -cv AND -m sni -t 1
 python EMIVEL.py -p test/ISW_2share.txt -cv AND -m pini -t 1
 ```
 
-RPS, RPC and RPE, counting random-probe subsets through order 2:
+RPS, RPC and RPE, counting random-probe subsets through cmax=2:
 
 ```sh
 python EMIVEL.py -p test/ISW_2share.txt -cv AND -m rps_secret -t 1 -c 2
@@ -79,7 +77,7 @@ python EMIVEL.py -p test/ISW_2share.txt -cv AND -m rpc -t 1 -c 2
 python EMIVEL.py -p test/ISW_2share.txt -cv AND -m rpe -t 1 -c 2
 ```
 
-Expected SNI result: functional correctness passes and all 15 first-order observations are `secure`. Random models report their coefficients and threshold bounds; this ISW example has no positive overall RPE threshold. Results append under `checkResult/`, with runtime and peak memory printed in the terminal.
+Results append under `checkResult/`, with runtime and peak memory printed in the terminal.
 
 The file uses `:=` for encoding, `=` for gadget operations, and `=:` for decoding. Encoding is excluded from transition/glitch extension. `inputs a0:2,b0:2` declares the two share families `(a0,a1)` and `(b0,b1)`. The `@c=a&b` line supplies the same reference for `-cv user`.
 
@@ -104,8 +102,6 @@ python EMIVEL.py -p test/ISW_2share.txt -cv AND -m probing_secret -t 1
 | Transition (all location pairs) | `-r transitionall` |
 | XOR-Transition | `-r transitionxor` |
 | Glitch | `-r glitch` |
-| Transition + Glitch | `-r transition glitch` |
-| Transition-all + Glitch | `-r transitionall glitch` |
 | Native maskVerif TG | `-r maskverifTG` |
 | Native IronMask TG | `-r ironmaskTG` |
 | Summed HW | `-r hw_sumed` |
@@ -115,7 +111,7 @@ python EMIVEL.py -p test/ISW_2share.txt -cv AND -m probing_secret -t 1
 | HW-Glitch (sum) | `-r glitch hw_sumed` |
 | HW-Glitch (vector) | `-r glitch hw_vector` |
 
-Either HW option can also be appended to a TG row. Choose only one: for observation components `(o1, ..., ok)`, `hw_sumed` produces `HW(o1) + ... + HW(ok)`, while `hw_vector` produces `(HW(o1), ..., HW(ok))`. For XOR-Transition, HW is applied after the transition XOR.
+Transition + Glitch is selected only through `maskverifTG` or `ironmaskTG`. Combining `glitch` with `transition`, `transitionall`, or `transitionxor` is rejected. Either HW option can also be appended to a TG row. Choose only one: for observation components `(o1, ..., ok)`, `hw_sumed` produces `HW(o1) + ... + HW(ok)`, while `hw_vector` produces `(HW(o1), ..., HW(ok))`. For XOR-Transition, HW is applied after the transition XOR.
 
 For example:
 
@@ -124,7 +120,7 @@ python EMIVEL.py -p test/ISW_2share.txt -cv AND -m probing_secret -t 1 -r glitch
 python EMIVEL.py -p test/ISW_2share.txt -cv AND -m probing_secret -t 1 -r glitch hw_vector
 ```
 
-This ISW file has no successive assignments to the same variable, so SSA-based Transition/TG commands do not exercise old/new overwrites. `transitionall` still generates circuit-location pairs. Encoding is excluded from both transition and glitch extensions. MI-only SNI is `secure`; the two HW-Glitch examples are `insecure`.
+This ISW file has no successive assignments to the same variable, so SSA-based Transition/TG commands do not exercise old/new overwrites. `transitionall` still generates circuit-location pairs. Encoding is excluded from both transition and glitch extensions.
 
 ## Common options
 
@@ -132,16 +128,16 @@ This ISW file has no successive assignments to the same variable, so SSA-based T
 | --- | --- |
 | `--tech static`, `mi`, `both` | Static-only, MI-only, or Hybrid; default: `both`. |
 | `-t N` | Ordinary probe budget or RPC/RPE simulation parameter; also required for RPS. |
-| `-c N` | Enumerate random-probe subsets through order N. |
+| `-c N` | Set the random-probing truncation parameter `c_max` to `N`. |
 | `-r hw_sumed` / `-r hw_vector` | Sum / vector of component HW values; combine with an ordinary leakage model as above. |
 | `--mcore N` | N worker processes; `0` runs sequentially. Analysis itself is serial. |
-| `--detail t` | Report insecure or unresolved observations as they finish. |
-| `--watch c0 c1` | Also report observations containing these assignment variables, including secure ones; source line numbers are also accepted. |
+| `--detail t` | For ordinary probing, report insecure or unresolved observations as they finish. Ignored for random probing. |
+| `--watch c0 c1` | For ordinary probing, also report observations containing these assignment variables, including secure ones; source line numbers are also accepted. Ignored for random probing. |
 | `--abort t` | Stop at the first insecure/unresolved result according to the selected technique. Default: `f`. |
 | `--maxhours N`, `--maxmem N` | Time limit in hours and per-process memory limit in GiB. |
 | `--tofile f` | Disable result saving. Default: `t`. |
 
-Use `python EMIVEL.py --help` for all options. Incomplete checks are reported explicitly. Each run reads the input file afresh; no parsed-gadget disk cache is used.
+Use `python EMIVEL.py --help` for all options. Incomplete checks are reported explicitly.
 
 ## Source layout
 

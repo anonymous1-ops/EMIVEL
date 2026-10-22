@@ -48,9 +48,10 @@ class TransitionPositions(Sequence):
         if isinstance(position, slice):
             return tuple(self[i] for i in range(*position.indices(len(self))))
         position = index(position)
+        count = len(self)
         if position < 0:
-            position += len(self)
-        if position < 0 or position >= len(self):
+            position += count
+        if position < 0 or position >= count:
             raise IndexError("transition position out of range")
         n = len(self.body)
         pairs = comb(n, 2)
@@ -89,7 +90,8 @@ class ObservationPlan(Sequence):
         return self.count
 
     def __bool__(self):
-        return self.count > 0
+        n = len(self.population)
+        return any(order <= n for order in self.orders)
 
     def __iter__(self):
         n = len(self.population)
@@ -102,6 +104,10 @@ class ObservationPlan(Sequence):
                         yield tuple(value for block in selection for value in block)
                 else:
                     yield from combinations(self.population, order)
+                continue
+            if order == 1:
+                for block in self.population:
+                    yield tuple(block) if self.flatten else (block,)
                 continue
             indices = list(range(order))
             selected = [self.population[i] for i in indices]
@@ -123,12 +129,13 @@ class ObservationPlan(Sequence):
                     selected[later] = self.population[indices[later]]
 
     def __getitem__(self, position):
+        count = self.count
         if isinstance(position, slice):
-            return tuple(self[i] for i in range(*position.indices(self.count)))
+            return tuple(self[i] for i in range(*position.indices(count)))
         position = index(position)
         if position < 0:
-            position += self.count
-        if position < 0 or position >= self.count:
+            position += count
+        if position < 0 or position >= count:
             raise IndexError("observation index out of range")
         n = len(self.population)
         for order in self.orders:
@@ -157,6 +164,99 @@ class ObservationPlan(Sequence):
             if self.flatten
             else selection
         )
+
+    def batches(self, maximum=64, tail_order=1, groups=None):
+        maximum = index(maximum)
+        if maximum < 1:
+            raise ValueError("batch size must be positive")
+        tail_order = index(tail_order)
+        if tail_order not in (1, 2):
+            raise ValueError("family tail order must be one or two")
+        if groups is not None:
+            batch = []
+            previous = None
+            for order, item, selection, weight in self.weighted(groups):
+                if batch and (order != previous or len(batch) == maximum):
+                    yield previous, (), tuple(batch)
+                    batch.clear()
+                batch.append((item, selection, weight))
+                previous = order
+            if batch:
+                yield previous, (), tuple(batch)
+            return
+        n = len(self.population)
+        for order in self.orders:
+            if order > n:
+                continue
+            if order == 0:
+                yield order, (), ()
+                continue
+            take = min(order, tail_order)
+            for prefix in combinations(range(n - take), order - take):
+                start = prefix[-1] + 1 if prefix else 0
+                for first in range(start, n, maximum):
+                    block = tuple(range(first, min(first + maximum, n)))
+                    if tail_order == 1:
+                        yield order, prefix, block
+                    elif take == 1:
+                        yield order, prefix, ((1, block),)
+                    else:
+                        if len(block) >= 2:
+                            yield order, prefix, ((2, block),)
+                        for second in range(first + maximum, n, maximum):
+                            other = tuple(range(second, min(second + maximum, n)))
+                            yield order, prefix, ((1, block), (1, other))
+
+    def weighted(self, groups):
+        groups = tuple(tuple(group) for group in groups)
+        if self.flatten or any(not group for group in groups) or sorted(
+            wire for group in groups for wire in group
+        ) != list(range(len(self.population))):
+            raise ValueError("weighted groups must partition the observation positions")
+        capacities = tuple(map(len, groups))
+        suffix = [0] * (len(groups) + 1)
+        for position in range(len(groups) - 1, -1, -1):
+            suffix[position] = suffix[position + 1] + capacities[position]
+
+        def choices(start, remaining):
+            for position in range(start, len(groups)):
+                if suffix[position] < remaining:
+                    break
+                minimum = max(1, remaining - suffix[position + 1])
+                for count in range(minimum, min(capacities[position], remaining) + 1):
+                    yield position, count
+
+        for order in self.orders:
+            if order > suffix[0]:
+                continue
+            if order == 0:
+                yield order, (), (), 1
+                continue
+            selected = []
+            stack = [(order, choices(0, order))]
+            while stack:
+                remaining, options = stack[-1]
+                try:
+                    position, count = next(options)
+                except StopIteration:
+                    stack.pop()
+                    if selected:
+                        selected.pop()
+                    continue
+                current = position, count
+                if count == remaining:
+                    selection = tuple(selected) + (current,)
+                    representative = tuple(sorted(
+                        wire
+                        for group, number in selection
+                        for wire in groups[group][:number]
+                    ))
+                    weight = prod(comb(capacities[group], number) for group, number in selection)
+                    yield order, representative, selection, weight
+                else:
+                    selected.append(current)
+                    rest = remaining - count
+                    stack.append((rest, choices(position + 1, rest)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,12 +310,13 @@ class OutputChoices(Sequence):
                 break
 
     def __getitem__(self, position):
+        count = self.count
         if isinstance(position, slice):
-            return tuple(self[i] for i in range(*position.indices(self.count)))
+            return tuple(self[i] for i in range(*position.indices(count)))
         position = index(position)
         if position < 0:
-            position += self.count
-        if position < 0 or position >= self.count:
+            position += count
+        if position < 0 or position >= count:
             raise IndexError("output choice out of range")
         selected = []
         for options in reversed(self.indices_per_group):
@@ -293,12 +394,13 @@ class OutputRequests(Sequence):
                 break
 
     def __getitem__(self, position):
+        count = self.count
         if isinstance(position, slice):
-            return tuple(self[i] for i in range(*position.indices(self.count)))
+            return tuple(self[i] for i in range(*position.indices(count)))
         position = index(position)
         if position < 0:
-            position += self.count
-        if position < 0 or position >= self.count:
+            position += count
+        if position < 0 or position >= count:
             raise IndexError("output request out of range")
         low_count = self.low_indices.count
         selected = []

@@ -702,7 +702,8 @@ class CorrectnessVerifier:
 
         unassigned_randoms = set(random_names)
         used_randoms = set()
-        for statement in ast.parse("\n".join(expressions)).body:
+        tree = ast.parse("\n".join(expressions))
+        for statement in tree.body:
             used_randoms.update(
                 node.id
                 for node in ast.walk(statement)
@@ -717,14 +718,14 @@ class CorrectnessVerifier:
         used_randoms.update(set(circuit_outputs) & unassigned_randoms)
         random_names = [name for name in random_names if name in used_randoms]
         circuit_inputs = secret_names + random_names
-        Fcircuit = self.compile(
-            self.gadget.name, expressions, circuit_inputs, circuit_outputs,
-            self.GF_field, field_namespace
-        )
+        if not is_bool:
+            Fcircuit = self.compile(
+                self.gadget.name, expressions, circuit_inputs, circuit_outputs,
+                self.GF_field, field_namespace
+            )
 
         packed = is_bool
         if packed:
-            tree = boolean_tree(expressions)
             for node in ast.walk(tree):
                 if isinstance(node, ast.Constant):
                     node.value = -int(node.value)
@@ -917,9 +918,14 @@ class LeakageAnalyzer:
                 )
             return code
         if "glitch" in options:
-            if "transitionall" in options:
-                return 33
-            return 3 if "transition" in options or "transitionxor" in options else 1
+            if any(
+                name in options for name in ("transition", "transitionall", "transitionxor")
+            ):
+                raise ValueError(
+                    "Transition/glitch combinations require maskverifTG or ironmaskTG; "
+                    "do not combine glitch with transition, transitionall, or transitionxor"
+                )
+            return 1
         if "transitionall" in options:
             return 22
         if "transition" in options:
@@ -1348,7 +1354,7 @@ class LeakageAnalyzer:
                 validate_inputs(expression, text, row, env)
                 source_reads.update(map(str, self.gadget.expression_info[text][1]))
             constant = self._literal_constant(rhs)
-            if constant is not None and not manual and not local_transition and robust not in (2, 3, 4):
+            if constant is not None and not manual and not local_transition and robust not in (2, 4):
                 if lhs in source_names and lhs not in source_reads:
                     leakage.pop(input_locations.get(lhs, lhs), None)
                 env[lhs] = constant
@@ -1396,22 +1402,22 @@ class LeakageAnalyzer:
                 if any(sympify(atom).free_symbols for atom in history):
                     leakage.setdefault(row, []).append(history)
                 continue
-            if lhs in source_names and lhs not in source_reads and robust not in (2, 3, 4):
+            if lhs in source_names and lhs not in source_reads and robust not in (2, 4):
                 leakage.pop(input_locations.get(lhs, lhs), None)
             elif (
                 lhs in source_names
                 and input_locations.get(lhs, lhs) in leakage
-                and robust in (2, 3, 4)
+                and robust in (2, 4)
             ):
                 source_reads.add(lhs)
             env[lhs] = value
             protected[lhs] = instruction.barrier
             channels[lhs] = (
                 (value,)
-                if instruction.barrier
+                if instruction.barrier or robust != 1
                 else tuple(atom for channel in operand_channels for atom in channel)
             )
-            current = (channels[lhs] if robust in (1, 3, 33) else (value,)) + manual
+            current = (channels[lhs] if robust == 1 else (value,)) + manual
             history = current
             if "transitionxor" not in self.gadget.checkOptions["robust"]:
                 history = tuple(
@@ -1421,7 +1427,7 @@ class LeakageAnalyzer:
                     and atom is not False
                     and not (not self.logic and isinstance(atom, Integer))
                 )
-            if robust in (2, 3, 4):
+            if robust in (2, 4):
                 history = previous_history.get(lhs, ()) + history
             previous_history[lhs] = current
             if any(sympify(atom).free_symbols for atom in history):
@@ -1449,7 +1455,7 @@ class LeakageAnalyzer:
         input_symbols = set(circuit_inputs)
         sharesIn_notrans = (
             {symbol: values for symbol, values in leakage.items() if symbol in input_symbols}
-            if self.robust in (22, 33)
+            if self.robust == 22
             else {}
         )
 
@@ -1475,7 +1481,7 @@ class LeakageAnalyzer:
                 ]
             else:
                 probes = list(leakage_out) + list(leakage_in)
-            if self.robust in (22, 33):
+            if self.robust == 22:
 
                 units = transition_units(probes, include_singletons=True)
                 orders = range(1, min(self.threshold, len(units)) + 1)
@@ -1485,7 +1491,7 @@ class LeakageAnalyzer:
                 orders = range(1, min(self.threshold, len(probes)) + 1)
                 observationsCheck = ObservationPlan(probes, orders)
                 checksize = sum(comb(len(probes), order) for order in orders)
-        elif self.robust == 22 or self.robust == 33:
+        elif self.robust == 22:
             units = transition_units(
                 list(leakage_out) + list(leakage_in),
                 include_singletons=hw or "transitionxor" in options,
@@ -1668,9 +1674,6 @@ class LeakageAnalyzer:
         group_width = self.gadget.shareNum * self.bits
         if len(outputs) % group_width:
             raise ValueError("Declared output shares do not match shares/bits")
-        output_groups = [
-            outputs[i : i + group_width] for i in range(0, len(outputs), group_width)
-        ]
 
         if self.model_str in ("rps_secret", "rps_share"):
             observationsCheck[0] = {self.model_str: []}
@@ -1682,6 +1685,9 @@ class LeakageAnalyzer:
                 "rpc": ObservationPlan(output_blocks, (self.threshold,), flatten=True)
             }
         else:
+            output_groups = [
+                outputs[i : i + group_width] for i in range(0, len(outputs), group_width)
+            ]
             low = ObservationPlan(range(self.gadget.shareNum), (self.threshold,))
             high = ObservationPlan(range(self.gadget.shareNum), (self.gadget.shareNum - 1,))
             observationsCheck[0] = {

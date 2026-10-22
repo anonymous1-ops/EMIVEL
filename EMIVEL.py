@@ -99,11 +99,11 @@ def print_parameters(circuit):
     builtin_print("Outputs = %s".rjust(50, "-") % str(circuit.secretsOutputs))
     builtin_print("Outputs (bits) = %s".rjust(50, "-") % str(circuit.secretsOutputsBits))
     builtin_print("Randoms = %s".rjust(50, "-") % str(circuit.randoms))
-    from galois import GF
-
     if circuit.field == "bool":
         builtin_print("Field = %s".rjust(50, "-") % circuit.field)
     else:
+        from galois import GF
+
         builtin_print("Field = %s".rjust(50, "-") % GF(circuit.field))
     if len(circuit.mapRow2Obs) < 20:
         builtin_print("All Probes = %s".rjust(50, "-") % circuit.mapRow2Obs)
@@ -340,7 +340,8 @@ def report_results(verifier, result):
         )
         suffix = ".random.jsonl" if verifier.randomprobing else ".verification.jsonl"
         with open(Path("checkResult") / (circuit.name + suffix), "a", encoding="utf-8") as file:
-            file.write(json.dumps(report, ensure_ascii=False, default=str) + "\n")
+            json.dump(report, file, ensure_ascii=False, default=str)
+            file.write("\n")
         console.print(f"result saved. total leakage ({len(circuit.row_mi)})", markup=False)
     console.print(footer, markup=False, soft_wrap=True)
 
@@ -411,7 +412,7 @@ def parseArgs():
         nargs="+",
         choices=GadgetsAnalysis.LeakageAnalyzer.LEAKAGE_OPTIONS,
         default=[],
-        help="Leakage options, including hw_sumed or hw_vector; HW is applied after transition XOR.",
+        help="Leakage options, including hw_sumed or hw_vector; HW is applied after transition XOR. For combined transition/glitch leakage, use maskverifTG or ironmaskTG.",
     )
 
     parser.add_argument(
@@ -444,14 +445,14 @@ def parseArgs():
         nargs=1,
         choices=["t", "f"],
         default="f",
-        help="Print live insecure/unresolved observations with source locations and MI/CMI when available.",
+        help="For ordinary probing, print live insecure/unresolved observations with source locations and MI/CMI when available. Ignored for random probing.",
     )
     parser.add_argument(
         "--watch",
         metavar="ROW_OR_LHS",
         nargs="+",
         default=[],
-        help="Also print observations containing these source line numbers or assignment variables, including secure ones. Works without --detail t.",
+        help="For ordinary probing, also print observations containing these source line numbers or assignment variables, including secure ones. Works without --detail t; ignored for random probing.",
     )
     parser.add_argument(
         "--tofile",
@@ -577,8 +578,6 @@ def maskingChecker():
                 else "💚" if status == "safe" else "💔"
             )
             text = f"{icon} ({locations}) {label}"
-            if payload["request"] is not None:
-                text += f"; request={payload['request']}"
             if payload["mi"] is not None:
                 value = payload["mi_text"] or payload["mi"]
                 text += f"; {payload['quantity']}={value}"
@@ -626,4 +625,8 @@ def maskingChecker():
 
 
 if __name__ == "__main__":
+    import sys
+
+    if "--help" in sys.argv[1:] or "-h" in sys.argv[1:]:
+        parseArgs()
     maskingChecker()
